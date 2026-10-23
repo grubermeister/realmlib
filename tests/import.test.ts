@@ -37,9 +37,9 @@ test(
           `state.set("k", 1);\n` +
           `const executed = executeInMemoryOperation(registry, store, { moduleId: "m", operation: "o", payloadVersion: 1, payload: null }, (_request, staged) => staged.set("j", 2));\n` +
           `const scheduler = createInMemoryScheduler();\n` +
-          `scheduler.schedule({ id: workItemId("w"), at: simTime(5), request: { moduleId: moduleId("m"), operation: "o", payloadVersion: 1, payload: null } });\n` +
-          `const advanced = scheduler.advanceTo(simTime(10), 1, () => {});\n` +
-          `const values = [entityId("e"), moduleId("m"), workItemId("w"), simTime(0), result.ok, state.get(moduleId("m"), "k"), executed.ok, state.get(moduleId("m"), "j"), advanced, scheduler.pendingCount(), createSeededRandom(1).nextFloat() * 2 ** 32];\n` +
+          `await scheduler.schedule({ id: workItemId("w"), at: simTime(5), request: { moduleId: moduleId("m"), operation: "o", payloadVersion: 1, payload: null } });\n` +
+          `const advanced = await scheduler.advanceTo(simTime(10), 1, () => {});\n` +
+          `const values = [entityId("e"), moduleId("m"), workItemId("w"), simTime(0), result.ok, state.get(moduleId("m"), "k"), executed.ok, state.get(moduleId("m"), "j"), advanced, await scheduler.pendingCount(), createSeededRandom(1).nextFloat() * 2 ** 32];\n` +
           `console.log(${JSON.stringify(marker)}, JSON.stringify(values));\n`,
       );
       await mkdir(join(consumerDir, "node_modules"));

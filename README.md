@@ -7,7 +7,8 @@ Bun programs without depending on either.
 It currently provides foundational value types (identifiers and simulation
 time), a registry for validating operation requests, an in-memory
 module state store, atomic execution of a single operation against that
-store, a manually advanced in-memory scheduler, and seeded random streams
+store, a manually advanced scheduler over replaceable storage (with an
+in-memory implementation), and seeded random streams
 whose draws commit with an operation; it contains **no simulation
 engine or behavior**.
 
@@ -195,9 +196,12 @@ a.get(moduleId("module-a"), "from"); // still { value: 6 }: nothing was committe
 
 ## Scheduling work
 
-An in-memory scheduler queues operation requests for simulation times and runs
-them **only when you advance it**, through a callback you supply to that call.
-There are no timers, no wall-clock reads, and no background work.
+A scheduler queues operation requests for simulation times and runs them
+**only when you advance it**, through a callback you supply to that call.
+There are no timers, no wall-clock reads, and no background work. Its clock,
+queue, ordering sequence, and work-ID history live in a
+[scheduler storage](#scheduler-storage); `createInMemoryScheduler()` uses new
+in-memory storage.
 
 ```ts
 import { createInMemoryScheduler, executeInMemoryOperation, moduleId, simTime, workItemId } from "realmlib";
@@ -205,13 +209,13 @@ import { createInMemoryScheduler, executeInMemoryOperation, moduleId, simTime, w
 // registry, store, and transfer as in "Executing an operation" above.
 const scheduler = createInMemoryScheduler(); // clock at simTime(0); or pass a starting SimTime
 
-scheduler.schedule({
+await scheduler.schedule({
   id: workItemId("job-1"),
   at: simTime(1_000),
   request: { moduleId: moduleId("module-a"), operation: "transfer", payloadVersion: 1, payload: 4 },
 });
 
-const result = scheduler.advanceTo(simTime(5_000), 100, (work) => {
+const result = await scheduler.advanceTo(simTime(5_000), 100, (work) => {
   // Throw on failure: a normal return counts as success and removes the item.
   const outcome = executeInMemoryOperation(registry, store, work.request, transfer);
   if (!outcome.ok) throw new Error(`rejected: ${outcome.reason}`);
@@ -219,33 +223,85 @@ const result = scheduler.advanceTo(simTime(5_000), 100, (work) => {
 result; // { now: 5000, executed: 1, reachedTarget: true }
 ```
 
+- **Every method returns a Promise**, and errors are reported as rejections:
+  `now()`, `pendingCount()`, `schedule()`, and `advanceTo()`. The `execute`
+  callback itself must still be synchronous.
 - `schedule(work)` validates the work ID, time (not earlier than `now()`), and
   request envelope (module ID, nonblank operation name, positive safe-integer
-  version) and stores a **copy**. The payload must be a `StateValue` (see
-  [In-memory module state](#in-memory-module-state)). Validation is structural
-  only: the registry is not consulted. Work IDs are **unique for the
-  scheduler's lifetime**: an ID may not be reused while it is pending or after
-  it has completed (the scheduler remembers every completed ID). Invalid input
-  or a duplicate throws and changes nothing.
+  version) and stores a **copy**, taken when `schedule()` is called. The payload
+  must be a `StateValue` (see [In-memory module state](#in-memory-module-state)).
+  Validation is structural only: the registry is not consulted. Work IDs are
+  **unique for the storage's lifetime**: an ID may not be reused while it is
+  pending or after it has completed (storage remembers every completed ID).
+  Invalid input or a duplicate rejects and changes nothing.
+- `schedule()` and `advanceTo()` calls on one scheduler take effect one at a
+  time, in call order, so unawaited `schedule()` calls keep their call order.
+  `now()` and `pendingCount()` read storage directly and see only calls that
+  have taken effect.
 - `advanceTo(target, maxOperations, execute)` runs items due **at or before**
   `target`, ordered by time and then by insertion order. Before each callback,
-  `now()` is set to that item's time. Each callback receives a fresh copy of
+  the clock is set to that item's time. Each callback receives a fresh copy of
   the work. `maxOperations` must be a positive safe integer.
 - When all due work has run, the clock moves to `target` and `reachedTarget` is
   `true`. If the limit stops it first, `reachedTarget` is `false`, the clock
   stays at the last executed item's time, and the remaining due work stays
   queued: call `advanceTo()` again to continue.
 - **`execute` must throw on failure.** If it throws, that item stays pending,
-  the clock stays at its time, the error propagates, and items that already
-  succeeded in the same call stay completed. A callback that returns a Promise
-  or thenable throws `TypeError` and the item stays pending; callbacks are never
-  awaited, and other return values are ignored.
-- **Callbacks cannot enqueue work:** calling `schedule()` or `advanceTo()` on the
-  same scheduler during a callback throws. `now()` and `pendingCount()` may be
-  read.
+  the clock stays at its time, the promise rejects with that error, and items
+  that already succeeded in the same call stay completed. A callback that
+  returns a Promise or thenable rejects with `TypeError` and the item stays
+  pending; callbacks are never awaited, and other return values are ignored.
+- **Callbacks cannot enqueue work:** while an `advanceTo()` is in flight, from a
+  callback or elsewhere, `schedule()` and `advanceTo()` on the same scheduler
+  reject. `now()` and `pendingCount()` may be called; a callback cannot await
+  them, but with in-memory storage the promises resolve to the values at the
+  time of the call.
 - The scheduler does not choose handlers, call `executeInMemoryOperation()` for
-  you, persist its queue, cancel work, or make queued work atomic with state
-  changes.
+  you, cancel work, or make queued work atomic with state changes.
+
+**API change (from synchronous):** `schedule(work): void` →
+`Promise<void>`, `advanceTo(...): AdvanceResult` → `Promise<AdvanceResult>`,
+`now(): SimTime` → `Promise<SimTime>`, `pendingCount(): number` →
+`Promise<number>`. The `InMemoryScheduler` type is now `Scheduler`.
+`createInMemoryScheduler(initialTime?)` is unchanged.
+
+### Scheduler storage
+
+`createScheduler(storage)` is the one scheduler implementation;
+`createInMemoryScheduler(t)` is `createScheduler(createInMemorySchedulerStorage(t))`.
+The scheduler owns ordering, validation, and advancement policy. A
+`SchedulerStorage` owns the authoritative data and only reads and changes it:
+
+| Method | Reads or changes |
+|--------|------------------|
+| `readClock()`, `writeClock(now)` | The simulation clock |
+| `readNextSequence()` | The next ordering sequence number |
+| `insertPending(work, nextSequence)` | Adds a pending `StoredWork` (`id`, `at`, `sequence`, `request`) and sets the next sequence, together |
+| `readDue(until, limit)` | At most `limit` pending items due at or before `until`, ordered by (`at`, `sequence`) |
+| `countPending()` | The number of pending items |
+| `readWorkIdStatus(id)` | `"pending"`, `"completed"`, or `undefined` |
+| `markCompleted(id)` | Removes a pending item and keeps its ID as completed |
+
+- Every method returns a Promise. The scheduler validates values before writing
+  them; storage must return validated values, and returned objects belong to
+  the caller. Storage rejects inserting an occupied ID or a sequence that does
+  not increase, and completing an ID that is not pending.
+- **Ordering key:** `(at, sequence)`. `schedule()` assigns the stored next
+  sequence and stores the next one, so sequences are never reused, even after
+  the queue empties. Rejected work consumes none.
+- **Commit points:** `schedule()` inserts once its checks pass. `advanceTo()`
+  writes the clock before each callback, marks the item completed after the
+  callback returns, and writes `target` to the clock if it reaches it.
+- **Lifetime:** storage outlives schedulers. A new `createScheduler(storage)`
+  continues from the stored clock, pending work, next sequence, and completed
+  IDs; it does not reset them. Use one scheduler per storage at a time.
+- `createInMemorySchedulerStorage(initialTime?)` starts with the clock at
+  `initialTime` (default `simTime(0)`), next sequence `0`, and no work. It keeps
+  only the IDs of completed work. Its data lives in that object and is never
+  persisted.
+- The fields correspond to `realmlib.runtime_state` (`now_ms`, `next_sequence`)
+  and `realmlib.work_items` (`status` `'pending'` or `'completed'`; a completed
+  item's time is the clock when it completed). No PostgreSQL storage exists yet.
 
 ## Seeded randomness
 

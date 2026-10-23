@@ -18,7 +18,15 @@ export { createInMemoryStateStore } from "./in-memory-state.ts";
 export type { InMemoryStateStore, ModuleStateAccess, StateValue } from "./in-memory-state.ts";
 export { executeInMemoryOperation } from "./execute-in-memory-operation.ts";
 export type { OperationHandler } from "./execute-in-memory-operation.ts";
-export { createInMemoryScheduler } from "./in-memory-scheduler.ts";
-export type { AdvanceResult, InMemoryScheduler, ScheduledWork } from "./in-memory-scheduler.ts";
+export { createScheduler } from "./scheduler.ts";
+export type {
+  AdvanceResult,
+  ScheduledWork,
+  Scheduler,
+  SchedulerStorage,
+  StoredWork,
+  WorkIdStatus,
+} from "./scheduler.ts";
+export { createInMemoryScheduler, createInMemorySchedulerStorage } from "./in-memory-scheduler.ts";
 export { createSeededRandom } from "./seeded-random.ts";
 export type { RandomSnapshot, RandomSource, SeededRandom } from "./seeded-random.ts";

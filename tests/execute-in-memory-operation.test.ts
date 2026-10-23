@@ -569,8 +569,10 @@ test("internal staging helpers are not exported from the package root", async ()
   const exported = Object.keys(await import("../src/index.ts")).sort();
   expect(exported).toEqual([
     "createInMemoryScheduler",
+    "createInMemorySchedulerStorage",
     "createInMemoryStateStore",
     "createModuleRegistry",
+    "createScheduler",
     "createSeededRandom",
     "entityId",
     "executeInMemoryOperation",
@@ -870,7 +872,7 @@ describe("random draws", () => {
     expect(validatePayload).not.toHaveBeenCalled();
   });
 
-  test("a scheduler callback commits draws once per successful item and preserves them on failure", () => {
+  test("a scheduler callback commits draws once per successful item and preserves them on failure", async () => {
     const { registry, store, direct } = setup();
     const random = createSeededRandom(seed);
     const scheduler = createInMemoryScheduler();
@@ -879,8 +881,8 @@ describe("random draws", () => {
       at: simTime(at),
       request: { moduleId: a, operation: "op-x", payloadVersion: 1, payload },
     });
-    scheduler.schedule(item("w1", 10, 1));
-    scheduler.schedule(item("w2", 20, 2));
+    await scheduler.schedule(item("w1", 10, 1));
+    await scheduler.schedule(item("w2", 20, 2));
 
     let failing = true;
     const handler: OperationHandler = (req, state, source) => {
@@ -894,36 +896,36 @@ describe("random draws", () => {
     };
 
     const expected = firstDraws(2);
-    expect(() => scheduler.advanceTo(simTime(30), 10, execute)).toThrow("not yet");
-    expect(scheduler.pendingCount()).toBe(1);
+    await expect(scheduler.advanceTo(simTime(30), 10, execute)).rejects.toThrow("not yet");
+    expect(await scheduler.pendingCount()).toBe(1);
     expect(direct.get(a, "k1")).toBe(expected[0]!);
     expectPosition(random, 1);
 
     failing = false;
-    expect(scheduler.advanceTo(simTime(30), 10, execute)).toEqual({ now: simTime(30), executed: 1, reachedTarget: true });
-    expect(scheduler.pendingCount()).toBe(0);
+    expect(await scheduler.advanceTo(simTime(30), 10, execute)).toEqual({ now: simTime(30), executed: 1, reachedTarget: true });
+    expect(await scheduler.pendingCount()).toBe(0);
     expect(direct.get(a, "k2")).toBe(expected[1]!);
     expectPosition(random, 2);
   });
 
-  test("a rejected scheduled request throws from the callback and leaves work and stream in place", () => {
+  test("a rejected scheduled request throws from the callback and leaves work and stream in place", async () => {
     const { registry, store } = setup();
     const random = createSeededRandom(seed);
     const scheduler = createInMemoryScheduler();
-    scheduler.schedule({
+    await scheduler.schedule({
       id: workItemId("w1"),
       at: simTime(10),
       request: { moduleId: a, operation: "op-x", payloadVersion: 1, payload: "not a number" },
     });
     const handler = mock<OperationHandler>((_request, _state, source) => void source!.nextFloat());
-    expect(() =>
+    await expect(
       scheduler.advanceTo(simTime(30), 10, (work) => {
         const outcome = executeInMemoryOperation(registry, store, work.request, handler, random);
         if (!outcome.ok) throw new Error(`rejected: ${outcome.reason}`);
       }),
-    ).toThrow("rejected: invalid-payload");
+    ).rejects.toThrow("rejected: invalid-payload");
     expect(handler).not.toHaveBeenCalled();
-    expect(scheduler.pendingCount()).toBe(1);
+    expect(await scheduler.pendingCount()).toBe(1);
     expectPosition(random, 0);
   });
 });
