@@ -259,6 +259,8 @@ describe("JSON values", () => {
       NaN,
       Infinity,
       -Infinity,
+      -0,
+      { nested: [1, -0] },
       1n,
       () => 1,
       Symbol("s"),

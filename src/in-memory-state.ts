@@ -10,7 +10,7 @@
 import { moduleId as toModuleId } from "./identifiers.ts";
 import type { ModuleId } from "./identifiers.ts";
 
-/** Ordinary JSON-compatible data. Numbers must be finite. */
+/** Ordinary JSON-compatible data. Numbers must be finite and not -0. */
 export type StateValue =
   | null
   | boolean
@@ -83,6 +83,8 @@ function copyStateValue(value: unknown, path: string, ancestors: Set<object>): S
       return value;
     case "number":
       if (!Number.isFinite(value)) throw invalid(path, `non-finite number ${value}`);
+      // JSON would silently turn -0 into 0.
+      if (Object.is(value, -0)) throw invalid(path, "negative zero");
       return value;
     case "object":
       break;

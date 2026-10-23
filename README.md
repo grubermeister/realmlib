@@ -124,7 +124,7 @@ a.delete("counter"); // true
   multi-record atomicity, or rollback. The store does not use the module
   registry.
 - Keys are nonblank, case-sensitive strings. Values must be `null`, booleans,
-  strings, finite numbers, dense arrays, or plain objects of these. Anything
+  strings, finite numbers other than `-0`, dense arrays, or plain objects of these. Anything
   else (`undefined`, `NaN`, class instances, `Date`, cycles, accessors, …)
   throws `TypeError` and leaves the existing record unchanged.
 - Values are copied on `set` and on `get`, so mutating an input or a returned
