@@ -28,7 +28,9 @@ test(
       );
       await writeFile(
         join(consumerDir, "probe.js"),
-        `import ${JSON.stringify(packageName)};\nconsole.log(${JSON.stringify(marker)});\n`,
+        `import { entityId, moduleId, workItemId, simTime } from ${JSON.stringify(packageName)};\n` +
+          `const values = [entityId("e"), moduleId("m"), workItemId("w"), simTime(0)];\n` +
+          `console.log(${JSON.stringify(marker)}, JSON.stringify(values));\n`,
       );
       await mkdir(join(consumerDir, "node_modules"));
       await symlink(repoRoot, linkPath, "dir");
@@ -53,7 +55,7 @@ test(
       ]);
 
       expect(stderr).toBe("");
-      expect(stdout).toBe(`${marker}\n`);
+      expect(stdout).toBe(`${marker} ["e","m","w",0]\n`);
       expect(exitCode).toBe(0);
     } finally {
       if (child && child.exitCode === null) child.kill("SIGKILL");
