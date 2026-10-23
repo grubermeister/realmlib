@@ -6,8 +6,9 @@ Bun programs without depending on either.
 
 It currently provides foundational value types (identifiers and simulation
 time), a registry for validating operation requests, an in-memory
-module state store, and atomic execution of a single operation against that
-store; it contains **no simulation engine or behavior**.
+module state store, atomic execution of a single operation against that
+store, and a manually advanced in-memory scheduler; it contains **no simulation
+engine or behavior**.
 
 The target runtime is Bun. Compatibility with Node.js or browsers is not established.
 
@@ -187,5 +188,59 @@ a.get(moduleId("module-a"), "from"); // still { value: 6 }: nothing was committe
   Executing another operation against the same store from inside a handler
   throws. Only stores from `createInMemoryStateStore()` are supported.
 - Choosing which handler belongs to which operation is the caller's job:
-  there is no handler registry, queue, or scheduler. Only changes made through
-  the staged view are covered.
+  there is no handler registry. Only changes made through the staged view are
+  covered. To run operations at simulation times, see
+  [Scheduling work](#scheduling-work).
+
+## Scheduling work
+
+An in-memory scheduler queues operation requests for simulation times and runs
+them **only when you advance it**, through a callback you supply to that call.
+There are no timers, no wall-clock reads, and no background work.
+
+```ts
+import { createInMemoryScheduler, executeInMemoryOperation, moduleId, simTime, workItemId } from "realmlib";
+
+// registry, store, and transfer as in "Executing an operation" above.
+const scheduler = createInMemoryScheduler(); // clock at simTime(0); or pass a starting SimTime
+
+scheduler.schedule({
+  id: workItemId("job-1"),
+  at: simTime(1_000),
+  request: { moduleId: moduleId("module-a"), operation: "transfer", payloadVersion: 1, payload: 4 },
+});
+
+const result = scheduler.advanceTo(simTime(5_000), 100, (work) => {
+  // Throw on failure: a normal return counts as success and removes the item.
+  const outcome = executeInMemoryOperation(registry, store, work.request, transfer);
+  if (!outcome.ok) throw new Error(`rejected: ${outcome.reason}`);
+});
+result; // { now: 5000, executed: 1, reachedTarget: true }
+```
+
+- `schedule(work)` validates the work ID, time (not earlier than `now()`), and
+  request envelope (module ID, nonblank operation name, positive safe-integer
+  version) and stores a **copy**. The payload must be a `StateValue` (see
+  [In-memory module state](#in-memory-module-state)). Validation is structural
+  only: the registry is not consulted. An ID may not be reused while it is
+  pending, but may be reused once that item has completed. Invalid input or a
+  duplicate throws and changes nothing.
+- `advanceTo(target, maxOperations, execute)` runs items due **at or before**
+  `target`, ordered by time and then by insertion order. Before each callback,
+  `now()` is set to that item's time. Each callback receives a fresh copy of
+  the work. `maxOperations` must be a positive safe integer.
+- When all due work has run, the clock moves to `target` and `reachedTarget` is
+  `true`. If the limit stops it first, `reachedTarget` is `false`, the clock
+  stays at the last executed item's time, and the remaining due work stays
+  queued: call `advanceTo()` again to continue.
+- **`execute` must throw on failure.** If it throws, that item stays pending,
+  the clock stays at its time, the error propagates, and items that already
+  succeeded in the same call stay completed. A callback that returns a Promise
+  or thenable throws `TypeError` and the item stays pending; callbacks are never
+  awaited, and other return values are ignored.
+- **Callbacks cannot enqueue work:** calling `schedule()` or `advanceTo()` on the
+  same scheduler during a callback throws. `now()` and `pendingCount()` may be
+  read.
+- The scheduler does not choose handlers, call `executeInMemoryOperation()` for
+  you, persist its queue, cancel work, or make queued work atomic with state
+  changes.

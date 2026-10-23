@@ -18,3 +18,5 @@ export { createInMemoryStateStore } from "./in-memory-state.ts";
 export type { InMemoryStateStore, ModuleStateAccess, StateValue } from "./in-memory-state.ts";
 export { executeInMemoryOperation } from "./execute-in-memory-operation.ts";
 export type { OperationHandler } from "./execute-in-memory-operation.ts";
+export { createInMemoryScheduler } from "./in-memory-scheduler.ts";
+export type { AdvanceResult, InMemoryScheduler, ScheduledWork } from "./in-memory-scheduler.ts";

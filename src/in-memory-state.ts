@@ -145,8 +145,14 @@ function copyObject(source: object, path: string, ancestors: Set<object>): { [ke
   return copy;
 }
 
-function copyState(value: unknown): StateValue {
-  return copyStateValue(value, "value", new Set());
+/**
+ * Returns a validated deep copy of `value` as a {@link StateValue}. `path` names
+ * the value in error messages. Package-internal: not exported from the package root.
+ *
+ * @throws {TypeError} if `value` is not a valid {@link StateValue}.
+ */
+export function copyState(value: unknown, path = "value"): StateValue {
+  return copyStateValue(value, path, new Set());
 }
 
 /**
