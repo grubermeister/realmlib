@@ -5,7 +5,8 @@ simulation infrastructure. It is intended to be imported by `edgelord` and other
 Bun programs without depending on either.
 
 It currently provides foundational value types (identifiers and simulation
-time) and a registry for validating operation requests; it contains **no
+time), a registry for validating operation requests, and an in-memory
+module state store; it contains **no
 simulation engine or behavior**.
 
 The target runtime is Bun. Compatibility with Node.js or browsers is not established.
@@ -97,3 +98,34 @@ if (result.ok) {
   throws `TypeError`.
 - On success, `request` is a fresh envelope; the payload is passed through
   unchanged (not copied, frozen, or checked for JSON serializability).
+
+## In-memory module state
+
+A store holds JSON-compatible values addressed by (module ID, key). Each module
+writes through an access object bound to it, and can read any module's records.
+
+```ts
+import { createInMemoryStateStore, moduleId } from "realmlib";
+
+const store = createInMemoryStateStore(); // new, empty, independent instance
+const a = store.forModule(moduleId("module-a"));
+const b = store.forModule(moduleId("module-b"));
+
+a.set("counter", { value: 1, tags: ["x"] });
+b.get(moduleId("module-a"), "counter"); // { value: 1, tags: ["x"] } (a copy)
+b.get(moduleId("module-a"), "missing"); // undefined
+a.delete("counter"); // true
+```
+
+- `get(owner, key)` reads from **any** module's namespace; `set(key, value)`
+  and `delete(key)` affect **only the bound owner's** records. Ownership is an
+  API boundary for trusted code, not a security mechanism.
+- Changes are **immediate and in-memory only**: there is no persistence,
+  multi-record atomicity, or rollback. The store does not use the module
+  registry.
+- Keys are nonblank, case-sensitive strings. Values must be `null`, booleans,
+  strings, finite numbers, dense arrays, or plain objects of these. Anything
+  else (`undefined`, `NaN`, class instances, `Date`, cycles, accessors, …)
+  throws `TypeError` and leaves the existing record unchanged.
+- Values are copied on `set` and on `get`, so mutating an input or a returned
+  value never changes stored state.

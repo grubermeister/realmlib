@@ -14,3 +14,5 @@ export type {
   OperationRequest,
   OperationValidationResult,
 } from "./module-registry.ts";
+export { createInMemoryStateStore } from "./in-memory-state.ts";
+export type { InMemoryStateStore, ModuleStateAccess, StateValue } from "./in-memory-state.ts";

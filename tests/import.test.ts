@@ -28,11 +28,13 @@ test(
       );
       await writeFile(
         join(consumerDir, "probe.js"),
-        `import { entityId, moduleId, workItemId, simTime, createModuleRegistry } from ${JSON.stringify(packageName)};\n` +
+        `import { entityId, moduleId, workItemId, simTime, createModuleRegistry, createInMemoryStateStore } from ${JSON.stringify(packageName)};\n` +
           `const registry = createModuleRegistry();\n` +
           `registry.register({ id: moduleId("m"), operations: [{ name: "o", version: 1, validatePayload: () => true }] });\n` +
           `const result = registry.validate({ moduleId: "m", operation: "o", payloadVersion: 1, payload: null });\n` +
-          `const values = [entityId("e"), moduleId("m"), workItemId("w"), simTime(0), result.ok];\n` +
+          `const state = createInMemoryStateStore().forModule(moduleId("m"));\n` +
+          `state.set("k", 1);\n` +
+          `const values = [entityId("e"), moduleId("m"), workItemId("w"), simTime(0), result.ok, state.get(moduleId("m"), "k")];\n` +
           `console.log(${JSON.stringify(marker)}, JSON.stringify(values));\n`,
       );
       await mkdir(join(consumerDir, "node_modules"));
@@ -58,7 +60,7 @@ test(
       ]);
 
       expect(stderr).toBe("");
-      expect(stdout).toBe(`${marker} ["e","m","w",0,true]\n`);
+      expect(stdout).toBe(`${marker} ["e","m","w",0,true,1]\n`);
       expect(exitCode).toBe(0);
     } finally {
       if (child && child.exitCode === null) child.kill("SIGKILL");
