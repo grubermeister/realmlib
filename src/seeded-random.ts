@@ -148,6 +148,8 @@ export function createSeededRandom(seedOrSnapshot: number | RandomSnapshot): See
 export interface RandomDraws {
   /** Draw-only view of the working copy; throws once `end()` has been called. */
   readonly source: RandomSource;
+  /** A fresh copy of the working copy's current state. */
+  snapshot(): RandomSnapshot;
   /** Publishes the working copy to the stream. Does not throw. */
   commit(): void;
   /** Invalidates `source` and releases the stream. Discards uncommitted draws. */
@@ -183,6 +185,11 @@ function beginRandomDraws(state: StreamState): RandomDraws {
     return nextFloatFrom(working);
   }
 
+  function snapshot(): RandomSnapshot {
+    const [w0, w1, w2, w3] = working;
+    return { algorithm: ALGORITHM, words: [w0, w1, w2, w3] };
+  }
+
   function commit(): void {
     if (active) state.words = working;
   }
@@ -193,5 +200,5 @@ function beginRandomDraws(state: StreamState): RandomDraws {
     state.busy = false;
   }
 
-  return { source: { nextFloat }, commit, end };
+  return { source: { nextFloat }, snapshot, commit, end };
 }

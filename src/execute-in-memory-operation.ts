@@ -5,11 +5,12 @@
  * registry, dispatch, queue, or scheduling here.
  */
 
+import type { ModuleId } from "./identifiers.ts";
 import { stagingFor } from "./in-memory-state.ts";
-import type { InMemoryStateStore, ModuleStateAccess } from "./in-memory-state.ts";
+import type { InMemoryStateStore, ModuleStateAccess, StateValue } from "./in-memory-state.ts";
 import type { ModuleRegistry, OperationRequest, OperationValidationResult } from "./module-registry.ts";
 import { randomDrawsFor } from "./seeded-random.ts";
-import type { RandomDraws, RandomSource, SeededRandom } from "./seeded-random.ts";
+import type { RandomDraws, RandomSnapshot, RandomSource, SeededRandom } from "./seeded-random.ts";
 
 /**
  * Applies one validated operation. Must be synchronous. `state` is a staged
@@ -53,6 +54,49 @@ export function executeInMemoryOperation(
   handler: OperationHandler,
   random?: SeededRandom,
 ): OperationValidationResult {
+  const staged = stageOperation(registry, store, input, handler, random);
+  if (!staged.ok) return staged;
+  try {
+    staged.publish();
+  } finally {
+    staged.end();
+  }
+  return staged.result;
+}
+
+/**
+ * An operation whose handler has returned but whose changes are not yet
+ * published. It keeps `store` and `random` held until `end()`.
+ * Package-internal: not exported from the package root.
+ */
+export interface StagedOperation {
+  readonly ok: true;
+  readonly result: OperationValidationResult & { readonly ok: true };
+  /** The module whose records the changes belong to. */
+  readonly owner: ModuleId;
+  /** Staged record changes in staging order; `undefined` marks a deletion. */
+  readonly changes: readonly (readonly [string, StateValue | undefined])[];
+  /** The stream's position after the handler's draws, if a stream was supplied. */
+  readonly random: RandomSnapshot | undefined;
+  /** Publishes the state changes and draws together. Does not throw. */
+  publish(): void;
+  /** Releases `store` and `random`, discarding anything not published. */
+  end(): void;
+}
+
+/**
+ * @internal Like {@link executeInMemoryOperation}, but on success returns the
+ * staged changes instead of publishing them, so the caller can make them
+ * durable first. The caller must call `end()`. On a validation failure, or if
+ * the handler throws or returns a thenable, nothing stays held.
+ */
+export function stageOperation(
+  registry: ModuleRegistry,
+  store: InMemoryStateStore,
+  input: unknown,
+  handler: OperationHandler,
+  random?: SeededRandom,
+): StagedOperation | (OperationValidationResult & { readonly ok: false }) {
   if (typeof handler !== "function") {
     throw new TypeError(`Operation handler must be a function, received ${typeof handler}`);
   }
@@ -70,12 +114,28 @@ export function executeInMemoryOperation(
     if (isThenable(returned)) {
       throw new TypeError("Operation handler must be synchronous, but it returned a Promise or thenable");
     }
-    // Both publications are single swaps that cannot throw, so they land together.
-    staged.commit();
-    draws?.commit();
-  } finally {
+    const changes = staged.changes();
+    const snapshot = draws?.snapshot();
+    const held = draws;
+    return {
+      ok: true,
+      result,
+      owner: staged.owner,
+      changes,
+      random: snapshot,
+      publish() {
+        // Both publications are single swaps that cannot throw, so they land together.
+        staged.commit();
+        held?.commit();
+      },
+      end() {
+        held?.end();
+        staged.end();
+      },
+    };
+  } catch (error) {
     draws?.end();
     staged.end();
+    throw error;
   }
-  return result;
 }

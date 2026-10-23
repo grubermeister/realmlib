@@ -8,8 +8,9 @@ It currently provides foundational value types (identifiers and simulation
 time), a registry for validating operation requests, an in-memory
 module state store, atomic execution of a single operation against that
 store, a manually advanced scheduler over replaceable storage (with in-memory
-and PostgreSQL implementations), and seeded random streams
-whose draws commit with an operation; it contains **no simulation
+and PostgreSQL implementations), seeded random streams
+whose draws commit with an operation, and a PostgreSQL path that commits each
+scheduled operation's effects in one transaction; it contains **no simulation
 engine or behavior**.
 
 The target runtime is Bun. Compatibility with Node.js or browsers is not established.
@@ -299,6 +300,13 @@ The scheduler owns ordering, validation, and advancement policy. A
 - **Commit points:** `schedule()` inserts once its checks pass. `advanceTo()`
   writes the clock before each callback, marks the item completed after the
   callback returns, and writes `target` to the clock if it reaches it.
+- **Optional `runWork(work, run)`:** storage may instead run each item as a
+  unit: set the clock to `work.at`, call `run()` (the callback), and mark the
+  item completed together with whatever it collected, or, if `run()` throws,
+  discard that, keep the item pending with the clock at `work.at`, and rethrow.
+  The scheduler then calls it in place of the separate `writeClock()` and
+  `markCompleted()`. In-memory and plain PostgreSQL storage do not define it;
+  see [Atomic PostgreSQL operations](#atomic-postgresql-operations).
 - **Lifetime:** storage outlives schedulers. A new `createScheduler(storage)`
   continues from the stored clock, pending work, next sequence, and completed
   IDs; it does not reset them. Use one scheduler per storage at a time.
@@ -416,8 +424,9 @@ await pool.end();
   runs no queries. Nothing opens or closes connections, reads the environment,
   applies the migration, or advances time for you.
 - **Initialization is explicit.** `initializePostgresSchedulerStorage(client,
-  initialTime?)` inserts the `runtime_state` row (clock `initialTime`, default
-  `simTime(0)`; next sequence `0`; no random snapshot; format version `1`). It
+  initialTime?, random?)` inserts the `runtime_state` row (clock `initialTime`,
+  default `simTime(0)`; next sequence `0`; random snapshot `random`, validated
+  first, default none; format version `1`). It
   first requires `server_encoding` and the connection's `client_encoding` to be
   `UTF8`, and it rejects if the row already exists or `work_items` has rows, so
   it never overwrites. Storage methods reject when the row is missing; they never
@@ -427,7 +436,8 @@ await pool.end();
   `markCompleted()` sets `status = 'completed'` and `completed_at_ms` to the
   **stored simulation clock**, never wall time, and keeps the row as the
   receipt, so its ID and sequence are never reused. `random_snapshot` and
-  `state_records` are not used.
+  `state_records` are used only by the
+  [operation runtime](#atomic-postgresql-operations).
 - `readDue()` is ordered by `(at_ms, sequence)` and limited in SQL.
   `insertPending()` inserts the row and advances `next_sequence` in **one
   statement**, so a duplicate ID, stale sequence, or failed insert consumes no
@@ -446,11 +456,11 @@ await pool.end();
   valid `StateValue`. Invalid persisted data rejects with `TypeError`. Database
   errors propagate; only a work-ID key violation is rethrown as a duplicate-ID
   `Error` whose `cause` is the original.
-- **Not atomic across an operation.** Each method is one statement, atomic by
-  itself. Nothing commits an operation's state changes, random draws, queue
-  change, and clock together, so a crash between them can, for example, leave
-  an item pending after its effects were applied elsewhere. Safe retries are
-  not provided.
+- **Not atomic across an operation by itself.** Each method is one statement,
+  atomic by itself. This storage alone does not commit an operation's state
+  changes, random draws, queue change, and clock together; the
+  [operation runtime](#atomic-postgresql-operations) does. Safe retries are not
+  provided.
 - **One driver per database.** Use one scheduler against a given database at a
   time. This is a precondition; it is not enforced, and concurrent drivers are
   not arbitrated.
@@ -466,3 +476,79 @@ REALMLIB_TEST_DATABASE_URL=postgresql://user@host/realmlib_scratch bun test
 ```
 
 `pg` and `@types/pg` are development dependencies, used only by these tests.
+
+## Atomic PostgreSQL operations
+
+`loadPostgresOperationRuntime(client)` makes the database, not an in-memory
+copy, authoritative for scheduled operations: each successfully executed work
+item commits **all** of its effects in **one PostgreSQL transaction**.
+
+```ts
+import pg from "pg";
+import { createSeededRandom, initializePostgresSchedulerStorage, loadPostgresOperationRuntime, moduleId, simTime } from "realmlib";
+
+const client = new pg.Client({ connectionString: process.env.DATABASE_URL }); // yours to connect and end
+await client.connect();
+// Once, for a new simulation; the random stream is optional.
+await initializePostgresSchedulerStorage(client, simTime(0), createSeededRandom(12345).snapshot());
+
+const runtime = await loadPostgresOperationRuntime(client);
+// registry and transfer as in "Executing an operation" above; schedule() as usual.
+await runtime.scheduler.advanceTo(simTime(5_000), 100, (work) => {
+  const outcome = runtime.execute(registry, work.request, transfer);
+  if (!outcome.ok) throw new Error(`rejected: ${outcome.reason}`);
+});
+runtime.read(moduleId("module-a"), "from"); // committed value
+await client.end();
+```
+
+- **Transaction boundary:** one per executed item: `BEGIN`; set `now_ms` to the
+  item's time; the callback runs; upsert or delete its module's
+  `state_records`; write `random_snapshot` (if a stream is configured);
+  complete the `work_items` row (`completed_at_ms` is the clock inside the
+  transaction, so the item's time); `COMMIT`. A multi-item `advanceTo()` is not
+  one transaction: earlier items stay committed if a later one fails. Advancing
+  the clock to the target, or with no work, is its own single statement, as
+  before. Execution never changes `next_sequence`, because callbacks cannot
+  schedule work.
+- **One dedicated connection:** `client` must be a single connection, such as
+  a `pg` `Client` or a `PoolClient` held for the runtime's lifetime, not inside
+  a transaction and not used by anything else meanwhile. A `pg` `Pool` is
+  refused, because each of its queries may use a different connection.
+  Creating, releasing, and closing the connection, applying the migration, and
+  initializing remain the caller's job. Nothing happens at import.
+- **Loading** reads `state_records` and `random_snapshot` in one read-only
+  transaction, validating them like any persisted data (for example, `-0` or an
+  invalid snapshot rejects with `TypeError`). Handlers read state
+  synchronously, so the runtime keeps these committed values in memory.
+- **Visible only after `COMMIT`:** `runtime.execute()` stages the handler's
+  changes and draws exactly as `executeInMemoryOperation()` does, with the same
+  validation, ownership, and copying. They are published to `read()`,
+  `randomSnapshot()`, and later handlers only after `COMMIT` succeeds;
+  otherwise they are discarded, so a failed attempt consumes no draws.
+- **Handler failure** (the callback throws or returns a thenable): the
+  transaction rolls back, then the clock is set to the item's time by a
+  separate statement, matching the scheduler's established behavior. The item
+  stays pending and its ID reserved; the error propagates.
+- **Database failure** before `COMMIT`: the transaction rolls back, including
+  its clock change, and the database error propagates; the clock is not moved
+  separately. If `COMMIT` itself is rejected by the server (for example by a
+  deferred constraint), nothing committed and the runtime stays usable.
+- **Unknown outcome:** if `COMMIT` fails without the server reporting an error
+  (for example the connection is lost), the runtime throws
+  `CommitOutcomeUnknownError` and refuses all further use, including `read()`
+  and its scheduler. It sends a `ROLLBACK`, which never commits, so a
+  transaction whose `COMMIT` never arrived releases its locks. It does **not**
+  retry or find out whether the item committed: check the database and load a
+  new runtime. A failed `ROLLBACK` likewise makes the runtime unusable.
+- **One operation per item:** `runtime.execute()` works only inside a callback
+  of `runtime.scheduler` (or another scheduler over `runtime.storage`), at most
+  once per item. A callback that runs no operation completes with only its
+  clock and receipt.
+- **Not covered:** external side effects of handlers, retries, crash recovery,
+  and concurrent drivers. Use one runtime per database at a time.
+
+**API additions:** `loadPostgresOperationRuntime`, `PostgresOperationRuntime`,
+`CommitOutcomeUnknownError`; an optional `runWork()` on `SchedulerStorage`; an
+optional third `random` argument to `initializePostgresSchedulerStorage()`.
+Existing signatures and in-memory behavior are unchanged.

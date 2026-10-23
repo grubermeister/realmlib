@@ -568,6 +568,7 @@ test("the store's public surface is unchanged", () => {
 test("internal staging helpers are not exported from the package root", async () => {
   const exported = Object.keys(await import("../src/index.ts")).sort();
   expect(exported).toEqual([
+    "CommitOutcomeUnknownError",
     "createInMemoryScheduler",
     "createInMemorySchedulerStorage",
     "createInMemoryStateStore",
@@ -578,6 +579,7 @@ test("internal staging helpers are not exported from the package root", async ()
     "entityId",
     "executeInMemoryOperation",
     "initializePostgresSchedulerStorage",
+    "loadPostgresOperationRuntime",
     "moduleId",
     "simTime",
     "workItemId",

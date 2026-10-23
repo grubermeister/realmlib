@@ -5,7 +5,8 @@
  * executes only inside `advanceTo()`, through the callback supplied to that call.
  * The scheduler owns ordering and advancement policy; the clock, ordering
  * sequence, queue, and work-ID history live in a {@link SchedulerStorage}.
- * There is no handler registry, dispatch, transaction layer, or cancellation here.
+ * There is no handler registry, dispatch, or cancellation here; storage may run
+ * each item as a transaction (see {@link SchedulerStorage.runWork}).
  */
 
 import { moduleId as toModuleId, textStorageProblem, workItemId as toWorkItemId } from "./identifiers.ts";
@@ -81,6 +82,17 @@ export interface SchedulerStorage {
    * @throws if `id` is not pending.
    */
   markCompleted(id: WorkItemId): Promise<void>;
+
+  /**
+   * Optional. Runs one due item as a unit, for storage that commits an item's
+   * effects together with its bookkeeping. It must set the clock to `work.at`,
+   * call `run()` once, and, if `run()` returns, mark `work` completed together
+   * with anything it collected during `run()`. If `run()` throws, it must keep
+   * `work` pending, leave the clock at `work.at`, discard what it collected,
+   * and reject with that error. Without it, the scheduler calls `writeClock()`
+   * before `run()` and `markCompleted()` after it.
+   */
+  runWork?(work: StoredWork, run: () => void): Promise<void>;
 }
 
 export interface AdvanceResult {
@@ -294,12 +306,19 @@ export function createScheduler(storage: SchedulerStorage): Scheduler {
           if (next === undefined) break;
           if (executed === limit) return { now: current, executed, reachedTarget: false };
           current = next.at;
-          await storage.writeClock(current);
-          const returned: unknown = execute(copyForCallback(next));
-          if (isThenable(returned)) {
-            throw new TypeError("execute must be synchronous, but it returned a Promise or thenable");
+          const run = (): void => {
+            const returned: unknown = execute(copyForCallback(next));
+            if (isThenable(returned)) {
+              throw new TypeError("execute must be synchronous, but it returned a Promise or thenable");
+            }
+          };
+          if (storage.runWork !== undefined) {
+            await storage.runWork(next, run);
+          } else {
+            await storage.writeClock(current);
+            run();
+            await storage.markCompleted(next.id);
           }
-          await storage.markCompleted(next.id);
           executed++;
         }
         current = to;

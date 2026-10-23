@@ -164,6 +164,13 @@ export function copyState(value: unknown, path = "value"): StateValue {
  */
 export interface StagedState {
   readonly access: ModuleStateAccess;
+  /** The module whose records `access` changes. */
+  readonly owner: ModuleId;
+  /**
+   * The staged changes, in staging order: each key with its staged value, or
+   * `undefined` for a deletion. Values are the private validated copies.
+   */
+  changes(): [string, StateValue | undefined][];
   /** Publishes every staged change at once. */
   commit(): void;
   /** Invalidates `access` and releases the store. Discards uncommitted changes. */
@@ -275,6 +282,11 @@ export function createInMemoryStateStore(): InMemoryStateStore {
       return exists;
     }
 
+    function changes(): [string, StateValue | undefined][] {
+      assertActive();
+      return [...overlay].map(([k, staged]) => [k, staged === DELETED ? undefined : staged]);
+    }
+
     function commit(): void {
       assertActive();
       if (overlay.size === 0) return;
@@ -296,7 +308,7 @@ export function createInMemoryStateStore(): InMemoryStateStore {
       staging = false;
     }
 
-    return { access: { get, set, delete: deleteRecord }, commit, end };
+    return { access: { get, set, delete: deleteRecord }, owner: bound as ModuleId, changes, commit, end };
   }
 
   const store: InMemoryStateStore = { forModule };

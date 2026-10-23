@@ -5,14 +5,17 @@
  * Data access and validation only. The caller supplies and owns the database
  * connection; nothing here opens connections, reads the environment, applies
  * migrations, or runs work. Each method is one SQL statement, so each is atomic
- * by itself, but nothing makes a whole operation (its state, random, queue, and
- * clock changes) commit together. One scheduler should drive the database at a
- * time; that is assumed, not enforced.
+ * by itself; this storage alone does not make a whole operation (its state,
+ * random, queue, and clock changes) commit together. For that, see
+ * `loadPostgresOperationRuntime()`. One scheduler should drive the database at
+ * a time; that is assumed, not enforced.
  */
 
 import { moduleId as toModuleId, workItemId as toWorkItemId } from "./identifiers.ts";
 import type { WorkItemId } from "./identifiers.ts";
 import { copyState } from "./in-memory-state.ts";
+import { createSeededRandom } from "./seeded-random.ts";
+import type { RandomSnapshot } from "./seeded-random.ts";
 import { validateOperationName, validatePositiveCount, validateRequest, validateSequence } from "./scheduler.ts";
 import type { SchedulerStorage, StoredWork, WorkIdStatus } from "./scheduler.ts";
 import { simTime as toSimTime } from "./sim-time.ts";
@@ -54,8 +57,8 @@ export function parseStoredInteger(text: unknown, min = 0): number {
   return Number(value);
 }
 
-/** Runs `read` on database-derived data, labelling any validation failure. */
-function persisted<T>(what: string, read: () => T): T {
+/** @internal Runs `read` on database-derived data, labelling any validation failure. */
+export function persisted<T>(what: string, read: () => T): T {
   try {
     return read();
   } catch (error) {
@@ -63,14 +66,16 @@ function persisted<T>(what: string, read: () => T): T {
   }
 }
 
-function validateClient(client: unknown): PostgresQueryable {
+/** @internal */
+export function validateClient(client: unknown): PostgresQueryable {
   if (typeof client !== "object" || client === null || typeof (client as PostgresQueryable).query !== "function") {
     throw new TypeError("client must be an object with a query(text, values) method, such as a pg Client or Pool");
   }
   return client as PostgresQueryable;
 }
 
-async function query(client: PostgresQueryable, text: string, values: unknown[]): Promise<Record<string, unknown>[]> {
+/** @internal Runs one statement and returns its rows, rejecting a malformed result. */
+export async function query(client: PostgresQueryable, text: string, values: unknown[]): Promise<Record<string, unknown>[]> {
   const result = await client.query(text, values);
   if (typeof result !== "object" || result === null || !Array.isArray(result.rows)) {
     throw new TypeError("client.query() must resolve to a result with a rows array");
@@ -78,7 +83,8 @@ async function query(client: PostgresQueryable, text: string, values: unknown[])
   return result.rows as Record<string, unknown>[];
 }
 
-function missingRuntimeState(): Error {
+/** @internal */
+export function missingRuntimeState(): Error {
   return new Error("realmlib.runtime_state has no row; call initializePostgresSchedulerStorage() first");
 }
 
@@ -87,6 +93,28 @@ function workIdStatus(value: unknown): Exclude<WorkIdStatus, undefined> {
     throw new RangeError(`unknown status ${JSON.stringify(value)}`);
   }
   return value;
+}
+
+/**
+ * @internal Reads one `runtime_state` column as text (SQL NULL as `null`) after
+ * checking that the row exists and has the supported format version.
+ */
+export async function readRuntimeText(
+  db: PostgresQueryable,
+  column: "now_ms" | "next_sequence" | "random_snapshot",
+): Promise<unknown> {
+  const [row] = await query(
+    db,
+    `SELECT ${column}::text AS value, format_version::text AS format_version
+     FROM realmlib.runtime_state WHERE singleton_id = 1`,
+    [],
+  );
+  if (row === undefined) throw missingRuntimeState();
+  const version = persisted("runtime_state.format_version", () => parseStoredInteger(row.format_version, 1));
+  if (version !== FORMAT_VERSION) {
+    throw new Error(`Unsupported realmlib.runtime_state.format_version ${version}; expected ${FORMAT_VERSION}`);
+  }
+  return row.value;
 }
 
 /** Validates one `work_items` row (BIGINT and JSON columns selected as text). */
@@ -111,8 +139,9 @@ function storedWorkFromRow(row: Record<string, unknown>): StoredWork {
 
 /**
  * Creates the `realmlib.runtime_state` row for fresh scheduler storage: clock at
- * `initialTime` (default `simTime(0)`), next sequence `0`, no random snapshot,
- * and format version 1. It never overwrites.
+ * `initialTime` (default `simTime(0)`), next sequence `0`, random snapshot
+ * `random` (default none, stored as SQL NULL), and format version 1. It never
+ * overwrites.
  *
  * It first requires the database's `server_encoding` and this connection's
  * `client_encoding` to be UTF8, the encoding the text validation assumes. The
@@ -122,16 +151,19 @@ function storedWorkFromRow(row: Record<string, unknown>): StoredWork {
  * `client_encoding` or `PGCLIENTENCODING`; keeping them at UTF8 is the caller's
  * responsibility.
  *
- * @throws {TypeError | RangeError} if `client` or `initialTime` is invalid.
+ * @throws {TypeError | RangeError} if `client`, `initialTime`, or `random` is invalid.
  * @throws if either encoding is not UTF8, the row already exists,
  *   `realmlib.work_items` is not empty, or the database reports an error.
  */
 export async function initializePostgresSchedulerStorage(
   client: PostgresQueryable,
   initialTime: SimTime = toSimTime(0),
+  random?: RandomSnapshot,
 ): Promise<void> {
   const db = validateClient(client);
   const now = toSimTime(initialTime);
+  // Restoring validates the snapshot (including -0) before it is serialized.
+  const snapshot = random === undefined ? null : JSON.stringify(createSeededRandom(random).snapshot());
   const [encodings] = await query(
     db,
     "SELECT current_setting('server_encoding') AS server, current_setting('client_encoding') AS client",
@@ -147,10 +179,10 @@ export async function initializePostgresSchedulerStorage(
   const rows = await query(
     db,
     `INSERT INTO realmlib.runtime_state (singleton_id, now_ms, next_sequence, random_snapshot, format_version)
-     SELECT 1, $1, 0, NULL, $2
+     SELECT 1, $1, 0, $3::json, $2
      WHERE NOT EXISTS (SELECT FROM realmlib.work_items)
      RETURNING 1`,
-    [String(now), FORMAT_VERSION],
+    [String(now), FORMAT_VERSION, snapshot],
   );
   if (rows.length !== 1) {
     throw new Error("Cannot initialize scheduler storage: realmlib.work_items already has rows");
@@ -177,18 +209,8 @@ export function createPostgresSchedulerStorage(client: PostgresQueryable): Sched
   const db = validateClient(client);
 
   async function readRuntime(column: "now_ms" | "next_sequence"): Promise<number> {
-    const [row] = await query(
-      db,
-      `SELECT ${column}::text AS value, format_version::text AS format_version
-       FROM realmlib.runtime_state WHERE singleton_id = 1`,
-      [],
-    );
-    if (row === undefined) throw missingRuntimeState();
-    const version = persisted("runtime_state.format_version", () => parseStoredInteger(row.format_version, 1));
-    if (version !== FORMAT_VERSION) {
-      throw new Error(`Unsupported realmlib.runtime_state.format_version ${version}; expected ${FORMAT_VERSION}`);
-    }
-    return persisted(`runtime_state.${column}`, () => parseStoredInteger(row.value));
+    const value = await readRuntimeText(db, column);
+    return persisted(`runtime_state.${column}`, () => parseStoredInteger(value));
   }
 
   return {
