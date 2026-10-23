@@ -7,7 +7,8 @@ Bun programs without depending on either.
 It currently provides foundational value types (identifiers and simulation
 time), a registry for validating operation requests, an in-memory
 module state store, atomic execution of a single operation against that
-store, and a manually advanced in-memory scheduler; it contains **no simulation
+store, a manually advanced in-memory scheduler, and seeded random streams
+whose draws commit with an operation; it contains **no simulation
 engine or behavior**.
 
 The target runtime is Bun. Compatibility with Node.js or browsers is not established.
@@ -244,3 +245,49 @@ result; // { now: 5000, executed: 1, reachedTarget: true }
 - The scheduler does not choose handlers, call `executeInMemoryOperation()` for
   you, persist its queue, cancel work, or make queued work atomic with state
   changes.
+
+## Seeded randomness
+
+`createSeededRandom` creates an independent pseudorandom stream from an explicit
+seed or a snapshot. Passing a stream as the optional last argument of
+`executeInMemoryOperation()` makes its draws part of the operation: they are
+kept only if the operation commits.
+
+```ts
+import { createSeededRandom, executeInMemoryOperation } from "realmlib";
+import type { OperationHandler, RandomSnapshot } from "realmlib";
+
+// registry, store, and input as in "Executing an operation" above.
+const random = createSeededRandom(12345); // unsigned 32-bit seed; never implicit
+
+const roll: OperationHandler = (request, state, rng) => {
+  state.set("roll", rng!.nextFloat()); // [0, 1)
+};
+executeInMemoryOperation(registry, store, input, roll, random); // draw committed with the state
+
+const saved: RandomSnapshot = random.snapshot(); // { algorithm: "xoshiro128ss-v1", words: [...] }
+const copy = createSeededRandom(JSON.parse(JSON.stringify(saved))); // continues identically
+```
+
+- **Not cryptographically secure.** The generator is xoshiro128\*\* 1.1 with
+  realmlib's own seed expansion; the `"xoshiro128ss-v1"` tag pins the exact
+  sequence, so equal seeds or snapshots always produce equal draws.
+- `nextFloat()` returns a number in `[0, 1)` from one 32-bit output. Calling it
+  directly on a stream advances that stream immediately.
+- Seeds are integers `0` through `4_294_967_295`; snapshots must carry the known
+  algorithm tag and four such words, not all zero. `-0` is rejected in both.
+  Wrong types throw `TypeError`, out-of-range values `RangeError`; nothing is
+  coerced. Snapshots are copied in and out, so mutating one never affects a stream.
+- **Rollback on failure:** inside an operation the handler's third argument
+  draws from a private working copy. If validation fails, the handler throws
+  (including an invalid staged value) or returns a Promise or thenable, the
+  stream keeps its pre-operation position, so a retry reproduces the same
+  draws. On success the draws are committed with the state changes, even if
+  the handler changed no state.
+- The handler's source is valid only during the call; using it afterwards
+  throws. While an operation holds a stream, drawing from it directly or
+  executing another operation with it throws. Without a stream, the handler's
+  third argument is `undefined`.
+- Draws are covered only through the handler's source; a stream captured some
+  other way is not rolled back. In a scheduler callback, pass the stream
+  explicitly and keep throwing when execution returns `{ ok: false }`.

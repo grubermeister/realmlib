@@ -28,7 +28,7 @@ test(
       );
       await writeFile(
         join(consumerDir, "probe.js"),
-        `import { entityId, moduleId, workItemId, simTime, createModuleRegistry, createInMemoryStateStore, executeInMemoryOperation, createInMemoryScheduler } from ${JSON.stringify(packageName)};\n` +
+        `import { entityId, moduleId, workItemId, simTime, createModuleRegistry, createInMemoryStateStore, executeInMemoryOperation, createInMemoryScheduler, createSeededRandom } from ${JSON.stringify(packageName)};\n` +
           `const registry = createModuleRegistry();\n` +
           `registry.register({ id: moduleId("m"), operations: [{ name: "o", version: 1, validatePayload: () => true }] });\n` +
           `const result = registry.validate({ moduleId: "m", operation: "o", payloadVersion: 1, payload: null });\n` +
@@ -39,7 +39,7 @@ test(
           `const scheduler = createInMemoryScheduler();\n` +
           `scheduler.schedule({ id: workItemId("w"), at: simTime(5), request: { moduleId: moduleId("m"), operation: "o", payloadVersion: 1, payload: null } });\n` +
           `const advanced = scheduler.advanceTo(simTime(10), 1, () => {});\n` +
-          `const values = [entityId("e"), moduleId("m"), workItemId("w"), simTime(0), result.ok, state.get(moduleId("m"), "k"), executed.ok, state.get(moduleId("m"), "j"), advanced, scheduler.pendingCount()];\n` +
+          `const values = [entityId("e"), moduleId("m"), workItemId("w"), simTime(0), result.ok, state.get(moduleId("m"), "k"), executed.ok, state.get(moduleId("m"), "j"), advanced, scheduler.pendingCount(), createSeededRandom(1).nextFloat() * 2 ** 32];\n` +
           `console.log(${JSON.stringify(marker)}, JSON.stringify(values));\n`,
       );
       await mkdir(join(consumerDir, "node_modules"));
@@ -65,7 +65,7 @@ test(
       ]);
 
       expect(stderr).toBe("");
-      expect(stdout).toBe(`${marker} ["e","m","w",0,true,1,true,2,{"now":10,"executed":1,"reachedTarget":true},0]\n`);
+      expect(stdout).toBe(`${marker} ["e","m","w",0,true,1,true,2,{"now":10,"executed":1,"reachedTarget":true},0,2442144158]\n`);
       expect(exitCode).toBe(0);
     } finally {
       if (child && child.exitCode === null) child.kill("SIGKILL");

@@ -1,11 +1,22 @@
 import { describe, expect, mock, test } from "bun:test";
-import { createInMemoryStateStore, createModuleRegistry, executeInMemoryOperation, moduleId, simTime } from "../src/index.ts";
+import {
+  createInMemoryScheduler,
+  createInMemoryStateStore,
+  createModuleRegistry,
+  createSeededRandom,
+  executeInMemoryOperation,
+  moduleId,
+  simTime,
+  workItemId,
+} from "../src/index.ts";
 import type {
   InMemoryStateStore,
   ModuleStateAccess,
   OperationHandler,
   OperationRequest,
   OperationValidationResult,
+  RandomSource,
+  SeededRandom,
   StateValue,
 } from "../src/index.ts";
 
@@ -560,10 +571,359 @@ test("internal staging helpers are not exported from the package root", async ()
     "createInMemoryScheduler",
     "createInMemoryStateStore",
     "createModuleRegistry",
+    "createSeededRandom",
     "entityId",
     "executeInMemoryOperation",
     "moduleId",
     "simTime",
     "workItemId",
   ]);
+});
+
+describe("random draws", () => {
+  const seed = 42;
+
+  /** The stream's position, as the number of draws taken from `seed`. */
+  function expectPosition(random: SeededRandom, draws: number): void {
+    const reference = createSeededRandom(seed);
+    for (let i = 0; i < draws; i++) reference.nextFloat();
+    expect(random.snapshot()).toEqual(reference.snapshot());
+  }
+
+  function firstDraws(count: number): number[] {
+    const reference = createSeededRandom(seed);
+    return Array.from({ length: count }, () => reference.nextFloat());
+  }
+
+  test("without a stream the handler's third argument is undefined", () => {
+    const { registry, store } = setup();
+    const handler = mock<OperationHandler>(() => {});
+    executeInMemoryOperation(registry, store, request(), handler);
+    expect(handler.mock.calls[0]![2]).toBeUndefined();
+  });
+
+  test("an explicitly undefined stream behaves like an omitted one", () => {
+    const { registry, store, direct } = setup();
+    const handler = mock<OperationHandler>((_request, state) => state.set("k1", 2));
+    expect(executeInMemoryOperation(registry, store, request(), handler, undefined).ok).toBe(true);
+    expect(handler.mock.calls[0]![2]).toBeUndefined();
+    expect(direct.get(a, "k1")).toBe(2);
+  });
+
+  test("a successful operation commits both its state changes and its draws", () => {
+    const { registry, store, direct } = setup();
+    const random = createSeededRandom(seed);
+    const [expected] = firstDraws(1);
+    const result = executeInMemoryOperation(
+      registry,
+      store,
+      request(),
+      (_request, state, source) => {
+        state.set("k3", source!.nextFloat());
+      },
+      random,
+    );
+    expect(result.ok).toBe(true);
+    expect(direct.get(a, "k3")).toBe(expected!);
+    expectPosition(random, 1);
+    expect(random.nextFloat()).toBe(firstDraws(2)[1]!);
+  });
+
+  test("the handler receives a draw-only source, not the caller's stream", () => {
+    const { registry, store } = setup();
+    const random = createSeededRandom(seed);
+    let received: RandomSource | undefined;
+    executeInMemoryOperation(registry, store, request(), (_request, _state, source) => (received = source), random);
+    expect(received).not.toBe(random);
+    expect(Object.keys(received!)).toEqual(["nextFloat"]);
+  });
+
+  test("a successful operation with no state changes still commits its draws", () => {
+    const { registry, store } = setup();
+    const before = snapshot(store);
+    const random = createSeededRandom(seed);
+    executeInMemoryOperation(registry, store, request(), (_request, _state, source) => void source!.nextFloat(), random);
+    expect(snapshot(store)).toEqual(before);
+    expectPosition(random, 1);
+  });
+
+  test("successive operations continue the same sequence", () => {
+    const { registry, store } = setup();
+    const random = createSeededRandom(seed);
+    const seen: number[] = [];
+    for (let i = 0; i < 3; i++) {
+      executeInMemoryOperation(
+        registry,
+        store,
+        request(),
+        (_request, _state, source) => seen.push(source!.nextFloat(), source!.nextFloat()),
+        random,
+      );
+    }
+    expect(seen).toEqual(firstDraws(6));
+  });
+
+  test("a validation failure leaves the handler uncalled and the stream unchanged", () => {
+    const { registry, store } = setup();
+    const before = snapshot(store);
+    const random = createSeededRandom(seed);
+    const handler = mock<OperationHandler>((_request, state, source) => state.set("k1", source!.nextFloat()));
+    const result = executeInMemoryOperation(registry, store, request({ payload: "5" }), handler, random);
+    expect(result).toEqual({ ok: false, reason: "invalid-payload" });
+    expect(handler).not.toHaveBeenCalled();
+    expect(snapshot(store)).toEqual(before);
+    expectPosition(random, 0);
+  });
+
+  test("a throwing handler commits neither state nor draws, and a retry repeats the first draw", () => {
+    const { registry, store } = setup();
+    const before = snapshot(store);
+    const random = createSeededRandom(seed);
+    const error = new Error("handler failed");
+    let failedDraw: number | undefined;
+    expect(() =>
+      executeInMemoryOperation(
+        registry,
+        store,
+        request(),
+        (_request, state, source) => {
+          failedDraw = source!.nextFloat();
+          source!.nextFloat();
+          state.set("k1", failedDraw);
+          state.set("k3", 3);
+          state.delete("k2");
+          throw error;
+        },
+        random,
+      ),
+    ).toThrow(error);
+    expect(snapshot(store)).toEqual(before);
+    expectPosition(random, 0);
+
+    let retriedDraw: number | undefined;
+    executeInMemoryOperation(registry, store, request(), (_request, _state, source) => (retriedDraw = source!.nextFloat()), random);
+    expect(retriedDraw).toBe(failedDraw!);
+    expectPosition(random, 1);
+  });
+
+  test("an invalid staged -0 after drawing commits neither state nor draws", () => {
+    for (const value of [-0, [1, -0], { nested: { list: [0, -0] } }]) {
+      const { registry, store } = setup();
+      const before = snapshot(store);
+      const random = createSeededRandom(seed);
+      expect(() =>
+        executeInMemoryOperation(
+          registry,
+          store,
+          request(),
+          (_request, state, source) => {
+            state.set("k1", source!.nextFloat());
+            state.set("k3", value as StateValue);
+          },
+          random,
+        ),
+      ).toThrow(TypeError);
+      expect(snapshot(store)).toEqual(before);
+      expectPosition(random, 0);
+    }
+  });
+
+  test("a Promise- or thenable-returning handler commits neither state nor draws", () => {
+    const then = mock(() => {});
+    const handlers = [
+      async (_request: OperationRequest, state: ModuleStateAccess, source?: RandomSource) => {
+        state.set("k1", source!.nextFloat());
+      },
+      (_request: OperationRequest, state: ModuleStateAccess, source?: RandomSource) => {
+        state.set("k1", source!.nextFloat());
+        return { then };
+      },
+    ];
+    for (const handler of handlers) {
+      const { registry, store } = setup();
+      const before = snapshot(store);
+      const random = createSeededRandom(seed);
+      expect(() =>
+        executeInMemoryOperation(registry, store, request(), handler as unknown as OperationHandler, random),
+      ).toThrow(TypeError);
+      expect(snapshot(store)).toEqual(before);
+      expectPosition(random, 0);
+    }
+    expect(then).not.toHaveBeenCalled();
+  });
+
+  test("a retained source throws after success without changing the stream", () => {
+    const { registry, store } = setup();
+    const random = createSeededRandom(seed);
+    let retained: RandomSource | undefined;
+    executeInMemoryOperation(
+      registry,
+      store,
+      request(),
+      (_request, _state, source) => {
+        retained = source;
+        source!.nextFloat();
+      },
+      random,
+    );
+    expect(() => retained!.nextFloat()).toThrow();
+    expectPosition(random, 1);
+  });
+
+  test("a retained source throws after failure without changing the stream", () => {
+    const { registry, store } = setup();
+    const random = createSeededRandom(seed);
+    let retained: RandomSource | undefined;
+    expect(() =>
+      executeInMemoryOperation(
+        registry,
+        store,
+        request(),
+        (_request, _state, source) => {
+          retained = source;
+          source!.nextFloat();
+          throw new Error("fail");
+        },
+        random,
+      ),
+    ).toThrow("fail");
+    expect(() => retained!.nextFloat()).toThrow();
+    expectPosition(random, 0);
+  });
+
+  test("a retained source stays invalid during a later operation on the same stream", () => {
+    const { registry, store } = setup();
+    const random = createSeededRandom(seed);
+    let retained: RandomSource | undefined;
+    executeInMemoryOperation(registry, store, request(), (_request, _state, source) => (retained = source), random);
+    executeInMemoryOperation(
+      registry,
+      store,
+      request(),
+      (_request, _state, source) => {
+        expect(() => retained!.nextFloat()).toThrow();
+        source!.nextFloat();
+      },
+      random,
+    );
+    expectPosition(random, 1);
+  });
+
+  test("the caller's stream cannot be drawn from directly while an operation holds it", () => {
+    const { registry, store } = setup();
+    const random = createSeededRandom(seed);
+    executeInMemoryOperation(
+      registry,
+      store,
+      request(),
+      (_request, _state, source) => {
+        source!.nextFloat();
+        expect(() => random.nextFloat()).toThrow();
+        expect(random.snapshot()).toEqual(createSeededRandom(seed).snapshot());
+      },
+      random,
+    );
+    expectPosition(random, 1);
+    expect(() => random.nextFloat()).not.toThrow();
+  });
+
+  test("nested execution with the same stream fails, even against another store", () => {
+    const { registry, store } = setup();
+    const other = createInMemoryStateStore();
+    const random = createSeededRandom(seed);
+    const inner = mock<OperationHandler>(() => {});
+    executeInMemoryOperation(
+      registry,
+      store,
+      request(),
+      (_request, _state, source) => {
+        source!.nextFloat();
+        expect(() => executeInMemoryOperation(registry, other, request(), inner, random)).toThrow();
+      },
+      random,
+    );
+    expect(inner).not.toHaveBeenCalled();
+    expectPosition(random, 1);
+  });
+
+  test("a failed store reentrancy check releases the stream", () => {
+    const { registry, store } = setup();
+    const random = createSeededRandom(seed);
+    executeInMemoryOperation(registry, store, request(), () => {
+      expect(() => executeInMemoryOperation(registry, store, request(), () => {}, random)).toThrow();
+    });
+    expect(() => random.nextFloat()).not.toThrow();
+  });
+
+  test("a stream not created by createSeededRandom is rejected with TypeError before validation", () => {
+    const validatePayload = mock(() => true);
+    const registry = createModuleRegistry();
+    registry.register({ id: a, operations: [{ name: "op-x", version: 1, validatePayload }] });
+    const store = createInMemoryStateStore();
+    const real = createSeededRandom(seed);
+    const imitations: unknown[] = [null, 1, {}, { nextFloat: () => 0.5, snapshot: () => real.snapshot() }];
+    for (const imitation of imitations) {
+      expect(() => executeInMemoryOperation(registry, store, request(), () => {}, imitation as SeededRandom)).toThrow(
+        TypeError,
+      );
+    }
+    expect(validatePayload).not.toHaveBeenCalled();
+  });
+
+  test("a scheduler callback commits draws once per successful item and preserves them on failure", () => {
+    const { registry, store, direct } = setup();
+    const random = createSeededRandom(seed);
+    const scheduler = createInMemoryScheduler();
+    const item = (id: string, at: number, payload: number) => ({
+      id: workItemId(id),
+      at: simTime(at),
+      request: { moduleId: a, operation: "op-x", payloadVersion: 1, payload },
+    });
+    scheduler.schedule(item("w1", 10, 1));
+    scheduler.schedule(item("w2", 20, 2));
+
+    let failing = true;
+    const handler: OperationHandler = (req, state, source) => {
+      const draw = source!.nextFloat();
+      if (req.payload === 2 && failing) throw new Error("not yet");
+      state.set(`k${String(req.payload)}`, draw);
+    };
+    const execute = (work: { request: OperationRequest }) => {
+      const outcome = executeInMemoryOperation(registry, store, work.request, handler, random);
+      if (!outcome.ok) throw new Error(`rejected: ${outcome.reason}`);
+    };
+
+    const expected = firstDraws(2);
+    expect(() => scheduler.advanceTo(simTime(30), 10, execute)).toThrow("not yet");
+    expect(scheduler.pendingCount()).toBe(1);
+    expect(direct.get(a, "k1")).toBe(expected[0]!);
+    expectPosition(random, 1);
+
+    failing = false;
+    expect(scheduler.advanceTo(simTime(30), 10, execute)).toEqual({ now: simTime(30), executed: 1, reachedTarget: true });
+    expect(scheduler.pendingCount()).toBe(0);
+    expect(direct.get(a, "k2")).toBe(expected[1]!);
+    expectPosition(random, 2);
+  });
+
+  test("a rejected scheduled request throws from the callback and leaves work and stream in place", () => {
+    const { registry, store } = setup();
+    const random = createSeededRandom(seed);
+    const scheduler = createInMemoryScheduler();
+    scheduler.schedule({
+      id: workItemId("w1"),
+      at: simTime(10),
+      request: { moduleId: a, operation: "op-x", payloadVersion: 1, payload: "not a number" },
+    });
+    const handler = mock<OperationHandler>((_request, _state, source) => void source!.nextFloat());
+    expect(() =>
+      scheduler.advanceTo(simTime(30), 10, (work) => {
+        const outcome = executeInMemoryOperation(registry, store, work.request, handler, random);
+        if (!outcome.ok) throw new Error(`rejected: ${outcome.reason}`);
+      }),
+    ).toThrow("rejected: invalid-payload");
+    expect(handler).not.toHaveBeenCalled();
+    expect(scheduler.pendingCount()).toBe(1);
+    expectPosition(random, 0);
+  });
 });

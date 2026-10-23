@@ -20,3 +20,5 @@ export { executeInMemoryOperation } from "./execute-in-memory-operation.ts";
 export type { OperationHandler } from "./execute-in-memory-operation.ts";
 export { createInMemoryScheduler } from "./in-memory-scheduler.ts";
 export type { AdvanceResult, InMemoryScheduler, ScheduledWork } from "./in-memory-scheduler.ts";
+export { createSeededRandom } from "./seeded-random.ts";
+export type { RandomSnapshot, RandomSource, SeededRandom } from "./seeded-random.ts";
