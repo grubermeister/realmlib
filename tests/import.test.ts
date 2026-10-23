@@ -28,8 +28,11 @@ test(
       );
       await writeFile(
         join(consumerDir, "probe.js"),
-        `import { entityId, moduleId, workItemId, simTime } from ${JSON.stringify(packageName)};\n` +
-          `const values = [entityId("e"), moduleId("m"), workItemId("w"), simTime(0)];\n` +
+        `import { entityId, moduleId, workItemId, simTime, createModuleRegistry } from ${JSON.stringify(packageName)};\n` +
+          `const registry = createModuleRegistry();\n` +
+          `registry.register({ id: moduleId("m"), operations: [{ name: "o", version: 1, validatePayload: () => true }] });\n` +
+          `const result = registry.validate({ moduleId: "m", operation: "o", payloadVersion: 1, payload: null });\n` +
+          `const values = [entityId("e"), moduleId("m"), workItemId("w"), simTime(0), result.ok];\n` +
           `console.log(${JSON.stringify(marker)}, JSON.stringify(values));\n`,
       );
       await mkdir(join(consumerDir, "node_modules"));
@@ -55,7 +58,7 @@ test(
       ]);
 
       expect(stderr).toBe("");
-      expect(stdout).toBe(`${marker} ["e","m","w",0]\n`);
+      expect(stdout).toBe(`${marker} ["e","m","w",0,true]\n`);
       expect(exitCode).toBe(0);
     } finally {
       if (child && child.exitCode === null) child.kill("SIGKILL");

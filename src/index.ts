@@ -6,3 +6,11 @@ export { entityId, moduleId, workItemId } from "./identifiers.ts";
 export type { EntityId, ModuleId, WorkItemId } from "./identifiers.ts";
 export { simTime } from "./sim-time.ts";
 export type { SimTime } from "./sim-time.ts";
+export { createModuleRegistry } from "./module-registry.ts";
+export type {
+  ModuleDefinition,
+  ModuleRegistry,
+  OperationDefinition,
+  OperationRequest,
+  OperationValidationResult,
+} from "./module-registry.ts";
