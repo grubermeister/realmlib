@@ -5,9 +5,9 @@ simulation infrastructure. It is intended to be imported by `edgelord` and other
 Bun programs without depending on either.
 
 It currently provides foundational value types (identifiers and simulation
-time), a registry for validating operation requests, and an in-memory
-module state store; it contains **no
-simulation engine or behavior**.
+time), a registry for validating operation requests, an in-memory
+module state store, and atomic execution of a single operation against that
+store; it contains **no simulation engine or behavior**.
 
 The target runtime is Bun. Compatibility with Node.js or browsers is not established.
 
@@ -49,7 +49,8 @@ const at: SimTime = simTime(90_000); // 90 simulated seconds after the origin
 
 A registry records which operations each module accepts and validates incoming
 operation envelopes against them. It **does not execute operations**:
-registration and validation are all it does.
+registration and validation are all it does (see
+[Executing an operation](#executing-an-operation)).
 
 ```ts
 import { createModuleRegistry, moduleId } from "realmlib";
@@ -120,12 +121,71 @@ a.delete("counter"); // true
 - `get(owner, key)` reads from **any** module's namespace; `set(key, value)`
   and `delete(key)` affect **only the bound owner's** records. Ownership is an
   API boundary for trusted code, not a security mechanism.
-- Changes are **immediate and in-memory only**: there is no persistence,
-  multi-record atomicity, or rollback. The store does not use the module
-  registry.
+- Direct changes are **immediate and in-memory only**: there is no
+  persistence, multi-record atomicity, or rollback (for atomic multi-record
+  changes, see [Executing an operation](#executing-an-operation)). The store
+  does not use the module registry.
 - Keys are nonblank, case-sensitive strings. Values must be `null`, booleans,
   strings, finite numbers other than `-0`, dense arrays, or plain objects of these. Anything
   else (`undefined`, `NaN`, class instances, `Date`, cycles, accessors, …)
   throws `TypeError` and leaves the existing record unchanged.
 - Values are copied on `set` and on `get`, so mutating an input or a returned
   value never changes stored state.
+
+## Executing an operation
+
+`executeInMemoryOperation` validates one request with a registry and, if it is
+accepted, runs a handler you supply **for that call** against an in-memory
+store. The handler's changes are committed together, or not at all.
+
+```ts
+import { createInMemoryStateStore, createModuleRegistry, executeInMemoryOperation, moduleId } from "realmlib";
+import type { OperationHandler } from "realmlib";
+
+const registry = createModuleRegistry();
+registry.register({
+  id: moduleId("module-a"),
+  operations: [{ name: "transfer", version: 1, validatePayload: (p) => typeof p === "number" && p > 0 }],
+});
+
+const store = createInMemoryStateStore();
+const a = store.forModule(moduleId("module-a"));
+a.set("from", { value: 10 });
+a.set("to", { value: 0 });
+
+const transfer: OperationHandler = (request, state) => {
+  const amount = request.payload as number;
+  const from = state.get(request.moduleId, "from") as { value: number };
+  const to = state.get(request.moduleId, "to") as { value: number };
+  if (from.value < amount) throw new Error("insufficient value");
+  state.set("from", { value: from.value - amount });
+  state.set("to", { value: to.value + amount });
+};
+
+const input = { moduleId: "module-a", operation: "transfer", payloadVersion: 1, payload: 4 };
+executeInMemoryOperation(registry, store, input, transfer); // { ok: true, request }
+a.get(moduleId("module-a"), "from"); // { value: 6 }
+
+executeInMemoryOperation(registry, store, { ...input, payload: 100 }, transfer); // throws "insufficient value"
+a.get(moduleId("module-a"), "from"); // still { value: 6 }: nothing was committed
+```
+
+- The registry validates the input once. A rejected input returns the
+  registry's `{ ok: false, reason }` result; the handler is not called and the
+  store is unchanged. On success the registry's `{ ok: true, request }` result is
+  returned after the changes are committed.
+- The handler is called once with the validated request and a **staged** state
+  view bound to `request.moduleId`. `set` and `delete` are staged privately,
+  with the same validation and copying as direct access; the handler's own reads
+  see its staged changes, while every other reader sees the committed values
+  until the handler returns.
+- **Rollback on error:** if the handler throws (including an invalid staged
+  value), none of its changes are committed and the original error propagates.
+- Handlers must be synchronous. A non-function handler, or one returning a
+  Promise or other thenable, throws `TypeError` and commits nothing.
+- The staged view is valid only during the call; using it afterwards throws.
+  Executing another operation against the same store from inside a handler
+  throws. Only stores from `createInMemoryStateStore()` are supported.
+- Choosing which handler belongs to which operation is the caller's job:
+  there is no handler registry, queue, or scheduler. Only changes made through
+  the staged view are covered.

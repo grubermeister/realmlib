@@ -4,7 +4,8 @@
  * Records are addressed by (module ID, key). Any module may read any record,
  * but writes go through an access object bound to a single owning module.
  * Ownership is an API boundary for trusted code, not a security mechanism.
- * There is no persistence, multi-record atomicity, or rollback.
+ * Direct access has no persistence, multi-record atomicity, or rollback; a
+ * private staging path (see {@link stagingFor}) supports atomic operations.
  */
 
 import { moduleId as toModuleId } from "./identifiers.ts";
@@ -148,19 +149,59 @@ function copyState(value: unknown): StateValue {
   return copyStateValue(value, "value", new Set());
 }
 
+/**
+ * A staged, single-module view of a store. Writes through `access` go to a
+ * private overlay until `commit()` publishes them; `end()` invalidates `access`.
+ * Package-internal: not exported from the package root.
+ */
+export interface StagedState {
+  readonly access: ModuleStateAccess;
+  /** Publishes every staged change at once. */
+  commit(): void;
+  /** Invalidates `access` and releases the store. Discards uncommitted changes. */
+  end(): void;
+}
+
+/** Starts staging changes for `owner`. Throws if the store is already staging. */
+export type BeginStagedState = (owner: ModuleId) => StagedState;
+
+const stagingByStore = new WeakMap<InMemoryStateStore, BeginStagedState>();
+
+/**
+ * Returns the private staging entry point of a store created by
+ * {@link createInMemoryStateStore}. Package-internal.
+ *
+ * @throws {TypeError} if `store` was not created by `createInMemoryStateStore`.
+ */
+export function stagingFor(store: InMemoryStateStore): BeginStagedState {
+  const begin = typeof store === "object" && store !== null ? stagingByStore.get(store) : undefined;
+  if (begin === undefined) {
+    throw new TypeError("Store must be created by createInMemoryStateStore()");
+  }
+  return begin;
+}
+
+/** Marks a staged deletion in an overlay. */
+const DELETED: unique symbol = Symbol("deleted");
+
 /** Creates a new, empty store. Instances share no state. */
 export function createInMemoryStateStore(): InMemoryStateStore {
   const namespaces = new Map<string, Map<string, StateValue>>();
+  let staging = false;
+
+  function readCommitted(owner: ModuleId, key: string): StateValue | undefined {
+    const id: string = toModuleId(owner);
+    const k = validateKey(key);
+    const records = namespaces.get(id);
+    if (records === undefined || !records.has(k)) return undefined;
+    return copyState(records.get(k));
+  }
 
   function forModule(owner: ModuleId): ModuleStateAccess {
     const bound: string = toModuleId(owner);
 
     function get(owner: ModuleId, key: string): StateValue | undefined {
-      const id: string = toModuleId(owner);
-      const k = validateKey(key);
-      const records = namespaces.get(id);
-      if (records === undefined || !records.has(k)) return undefined;
-      return copyState(records.get(k));
+      return readCommitted(owner, key);
     }
 
     function set(key: string, value: StateValue): void {
@@ -186,5 +227,71 @@ export function createInMemoryStateStore(): InMemoryStateStore {
     return { get, set, delete: deleteRecord };
   }
 
-  return { forModule };
+  function beginStaged(owner: ModuleId): StagedState {
+    const bound: string = toModuleId(owner);
+    if (staging) {
+      throw new Error("Store is already executing an operation; nested execution is not supported");
+    }
+    staging = true;
+    let active = true;
+    // Staged changes to the bound module's records. Values are validated copies.
+    const overlay = new Map<string, StateValue | typeof DELETED>();
+
+    function assertActive(): void {
+      if (!active) throw new Error("Staged state access is no longer valid: its operation has ended");
+    }
+
+    function get(owner: ModuleId, key: string): StateValue | undefined {
+      assertActive();
+      const id: string = toModuleId(owner);
+      const k = validateKey(key);
+      if (id === bound && overlay.has(k)) {
+        const staged = overlay.get(k)!;
+        return staged === DELETED ? undefined : copyState(staged);
+      }
+      return readCommitted(owner, k);
+    }
+
+    function set(key: string, value: StateValue): void {
+      assertActive();
+      const k = validateKey(key);
+      overlay.set(k, copyState(value));
+    }
+
+    function deleteRecord(key: string): boolean {
+      assertActive();
+      const k = validateKey(key);
+      const staged = overlay.get(k);
+      const exists = staged === undefined ? namespaces.get(bound)?.has(k) === true : staged !== DELETED;
+      if (exists) overlay.set(k, DELETED);
+      return exists;
+    }
+
+    function commit(): void {
+      assertActive();
+      if (overlay.size === 0) return;
+      // Build the module's next namespace privately, then publish it with one swap.
+      const next = new Map(namespaces.get(bound));
+      for (const [k, staged] of overlay) {
+        if (staged === DELETED) next.delete(k);
+        else next.set(k, staged);
+      }
+      if (next.size === 0) namespaces.delete(bound);
+      else namespaces.set(bound, next);
+      overlay.clear();
+    }
+
+    function end(): void {
+      if (!active) return;
+      active = false;
+      overlay.clear();
+      staging = false;
+    }
+
+    return { access: { get, set, delete: deleteRecord }, commit, end };
+  }
+
+  const store: InMemoryStateStore = { forModule };
+  stagingByStore.set(store, beginStaged);
+  return store;
 }
