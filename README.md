@@ -291,3 +291,35 @@ const copy = createSeededRandom(JSON.parse(JSON.stringify(saved))); // continues
 - Draws are covered only through the handler's source; a stream captured some
   other way is not rolled back. In a scheduler callback, pass the stream
   explicitly and keep throwing when execution returns `{ ok: false }`.
+
+## PostgreSQL schema
+
+[`migrations/001_initial_persistence.sql`](migrations/001_initial_persistence.sql)
+defines durable storage for one simulation in a dedicated `realmlib` schema,
+targeting **PostgreSQL 18**. It is a plain SQL asset: nothing in the library
+imports it, connects to a database, or uses its tables yet.
+
+| Table                    | Holds                                                                 |
+|--------------------------|-----------------------------------------------------------------------|
+| `realmlib.runtime_state` | The singleton row (`singleton_id = 1`): simulation clock, next work sequence number, optional random snapshot, and stored-data format version |
+| `realmlib.state_records` | The current value at each (module ID, key) address                     |
+| `realmlib.work_items`    | Pending scheduled work and receipts of completed work, which keep their work ID and sequence; a partial index orders pending work by time, then sequence |
+
+- **Not yet automated:** applying the migration (there is no runner or
+  migration-history table) and creating the `runtime_state` row are left to
+  the application. The file has no transaction control, so apply it in one
+  transaction, for example `psql --single-transaction --file migrations/001_initial_persistence.sql`.
+- Values are stored as `JSON` (not `JSONB`) so serialized text is kept
+  unchanged. Times, sequences, and payload versions are `BIGINT` limited to the
+  JavaScript safe-integer range. These checks are a backstop: values must still
+  be validated in JavaScript (for example, to reject `-0`) before writing and
+  after reading.
+
+The schema test is opt-in. It applies the migration to a **separate,
+disposable** database inside a transaction, checks the constraints, and rolls
+everything back; it refuses to run if a `realmlib` schema already exists. It
+needs `psql` and is skipped unless the variable is set:
+
+```sh
+REALMLIB_TEST_DATABASE_URL=postgresql://user@host/realmlib_scratch bun test tests/postgres-schema.test.ts
+```
