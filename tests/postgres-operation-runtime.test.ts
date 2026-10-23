@@ -3,10 +3,12 @@ import { realpath } from "node:fs/promises";
 import { join } from "node:path";
 import pg from "pg";
 import {
+  CommitNotConfirmedError,
   CommitOutcomeUnknownError,
   createInMemoryScheduler,
   createInMemoryStateStore,
   createModuleRegistry,
+  createPostgresSchedulerStorage,
   createScheduler,
   createSeededRandom,
   executeInMemoryOperation,
@@ -181,6 +183,9 @@ describe("PostgreSQL operation runtime without a database", () => {
       async readWorkIdStatus() {
         return undefined;
       },
+      async readWork() {
+        return undefined;
+      },
       async markCompleted() {
         calls.push("markCompleted");
       },
@@ -274,31 +279,54 @@ function definePostgresTests(url: string): void {
     );
   }
 
-  type Fault = { when: (text: string) => boolean; phase: "before" | "after"; error?: () => unknown };
+  type Fault = {
+    when: (text: string) => boolean;
+    /** Fail before the statement is sent, fail after it has run, or (`tamper`) rewrite its result rows. */
+    phase: "before" | "after" | "tamper";
+    error?: () => unknown;
+    /** For `after`: runs once the statement has run, before the failure is reported. */
+    then?: () => Promise<unknown>;
+    rows?: (rows: Record<string, unknown>[]) => Record<string, unknown>[];
+  };
 
-  /** Wraps a driver connection so one chosen statement fails, before or after it reaches the database. */
+  /** Wraps a driver connection so chosen statements fail, before or after they reach the database. */
   function faulty(target: pg.Client) {
     const seen: string[] = [];
-    let fault: Fault | undefined;
+    // Each armed fault fires once, on the first statement it matches.
+    const faults: Fault[] = [];
     const client: PostgresQueryable = {
       async query(text, values) {
         seen.push(text);
-        const armed = fault !== undefined && fault.when(text) ? fault : undefined;
-        if (armed) fault = undefined;
+        const index = faults.findIndex((f) => f.when(text));
+        const armed = index === -1 ? undefined : faults.splice(index, 1)[0]!;
         const failure = () => (armed!.error ?? (() => new Error("injected database failure")))();
         if (armed?.phase === "before") throw failure();
         const result = await target.query(text, values);
-        if (armed?.phase === "after") throw failure();
+        if (armed?.phase === "tamper") return { ...result, rows: armed.rows!(result.rows) };
+        if (armed?.phase === "after") {
+          await armed.then?.();
+          throw failure();
+        }
         return result;
       },
     };
     return {
       client,
       seen,
-      arm(next: Fault) {
-        fault = next;
+      arm(...next: Fault[]) {
+        faults.push(...next);
       },
     };
+  }
+
+  /** `countAndRoll`, counting its invocations. */
+  function counted() {
+    const calls: string[] = [];
+    const handler: OperationHandler = (request, state, random) => {
+      calls.push(JSON.stringify(request.payload));
+      countAndRoll(request, state, random);
+    };
+    return { calls, handler };
   }
 
   describeSchedulerStorageContract("PostgreSQL operation runtime", async (initialTime) => {
@@ -367,6 +395,61 @@ function definePostgresTests(url: string): void {
       expect(after.runtime.random_snapshot).toBe(JSON.stringify(inMemoryReference([{ n: 1 }, { n: 2 }]).random));
       expect(after.runtime.now_ms).toBe("500");
       await expect(reloaded.scheduler.schedule(work("w2", 600))).rejects.toThrow("has already completed");
+    });
+
+    test("resubmissions are harmless pending and completed, across new runtimes and storage adapters", async () => {
+      await reset(0);
+      const runtime = await loadPostgresOperationRuntime(await driver());
+      const original = work("w1", 10, a, { n: 1, tags: ["x", "y"] });
+      expect(await runtime.scheduler.schedule(original)).toBe("accepted");
+      expect(await runtime.scheduler.schedule(work("w2", 50, a, { n: 2 }))).toBe("accepted");
+
+      // Pending: still exactly one row with its original sequence, and no sequence consumed.
+      const pending = await committed();
+      expect(await runtime.scheduler.schedule(work("w1", 10, a, { tags: ["x", "y"], n: 1 }))).toBe("already-pending");
+      await expect(runtime.scheduler.schedule(work("w1", 10, a, { n: 1, tags: ["y", "x"] }))).rejects.toThrow(
+        "is already pending",
+      );
+      await expect(runtime.scheduler.schedule(work("w1", 10, b, { n: 1, tags: ["x", "y"] }))).rejects.toThrow(
+        "is already pending",
+      );
+      expect(await committed()).toEqual(pending);
+      expect(pending.items.map((r) => [r.work_id, r.sequence])).toEqual([["w1", "0"], ["w2", "1"]]);
+      expect(pending.runtime.next_sequence).toBe("2");
+
+      // Completed: the handler changed a record and drew a number; the receipt keeps the request.
+      const { calls, handler } = counted();
+      await runtime.scheduler.advanceTo(simTime(20), 10, through(runtime, handler));
+      expect(calls).toHaveLength(1);
+      const done = await committed();
+      expect(done.items[0]).toEqual({
+        work_id: "w1",
+        at_ms: "10",
+        sequence: "0",
+        payload: '{"n":1,"tags":["x","y"]}',
+        status: "completed",
+        completed_at_ms: "10",
+      });
+      expect(recordsOf(done)).toEqual(inMemoryReference([{ n: 1, tags: ["x", "y"] }]).records);
+
+      const reloaded = await loadPostgresOperationRuntime(await driver());
+      const plain = createScheduler(createPostgresSchedulerStorage(await driver()));
+      for (const scheduler of [runtime.scheduler, reloaded.scheduler, plain]) {
+        expect(await scheduler.schedule(original)).toBe("already-completed");
+        for (const variant of [
+          work("w1", 20, a, { n: 1, tags: ["x", "y"] }),
+          work("w1", 10, a, { n: 1, tags: ["x", "y", "z"] }),
+          { ...original, request: { ...original.request, payloadVersion: 2 } },
+          { ...original, request: { ...original.request, operation: "op-y" } },
+        ]) {
+          await expect(scheduler.schedule(variant)).rejects.toThrow("has already completed");
+        }
+      }
+      // Advancing over its time again runs nothing: state, draws, clock, sequence, receipt, and queue are unchanged.
+      await reloaded.scheduler.advanceTo(simTime(20), 10, through(reloaded, handler));
+      expect(calls).toHaveLength(1);
+      expect(await committed()).toEqual(done);
+      expect(reloaded.randomSnapshot()).toEqual(runtime.randomSnapshot());
     });
 
     test("deletions and records of other modules are committed by owner", async () => {
@@ -625,62 +708,194 @@ function definePostgresTests(url: string): void {
       }
     });
 
-    test("a COMMIT with an unknown outcome is surfaced, not retried, and the runtime refuses further use", async () => {
-      // The reply to a COMMIT that did commit is lost.
+    /** The reply to the item's COMMIT is lost, as if the connection had dropped, after the statement ran. */
+    const lostReply = (then?: () => Promise<unknown>): Fault => ({
+      when: (t) => t === "COMMIT",
+      phase: "after",
+      error: () => new Error("Connection terminated unexpectedly"),
+      then,
+    });
+    /** The statement that reads the work item's durable record. */
+    const receiptRead = (t: string) => t.includes("FROM realmlib.work_items WHERE work_id = $1");
+
+    test("a lost COMMIT reply after a real commit is confirmed from the receipt, and execution continues once", async () => {
       await reset(0);
       const conn = faulty(await driver());
       const runtime = await loadPostgresOperationRuntime(conn.client);
-      await runtime.scheduler.schedule(work("w", 10));
+      await runtime.scheduler.schedule(work("w1", 10, a, { n: 1 }));
+      await runtime.scheduler.schedule(work("w2", 20, a, { n: 2 }));
+      const { calls, handler } = counted();
       conn.seen.length = 0;
-      conn.arm({ when: (t) => t === "COMMIT", phase: "after", error: () => new Error("Connection terminated unexpectedly") });
-      const failure = await runtime.scheduler.advanceTo(simTime(20), 10, through(runtime)).catch((e: unknown) => e);
-      expect(failure).toBeInstanceOf(CommitOutcomeUnknownError);
-      expect((failure as Error).cause).toMatchObject({ message: "Connection terminated unexpectedly" });
-      // Sent once and never retried.
-      expect(conn.seen.filter((t) => t === "COMMIT")).toEqual(["COMMIT"]);
-      // It did commit, which only a reload can show; the old runtime exposes nothing.
-      expect((await committed()).items[0]).toMatchObject({ status: "completed" });
-      expect(() => runtime.read(a, "count")).toThrow("unusable");
-      expect(() => runtime.randomSnapshot()).toThrow("unusable");
-      await expect(runtime.scheduler.now()).rejects.toThrow("unusable");
-      await expect(runtime.scheduler.advanceTo(simTime(30), 1, () => {})).rejects.toThrow("unusable");
-      expect((await loadPostgresOperationRuntime(await driver())).read(a, "count")).toBe(1);
+      conn.arm(lostReply());
 
-      // A COMMIT that fails without reaching the server is just as ambiguous to the client. The
-      // runtime still sends ROLLBACK (which never commits), so the open transaction does not hold
-      // its locks; the observer's TRUNCATE in reset() would otherwise wait for it.
+      expect(await runtime.scheduler.advanceTo(simTime(30), 10, through(runtime, handler))).toEqual({
+        now: simTime(30),
+        executed: 2,
+        reachedTarget: true,
+      });
+      // Each handler ran once; the second saw the first's committed effects, reloaded from the database.
+      expect(calls).toEqual(['{"n":1}', '{"n":2}']);
+      expect(conn.seen.filter((t) => t === "COMMIT")).toHaveLength(2 + 1); // two items, one reconciliation read
+      const firstCommit = conn.seen.indexOf("COMMIT");
+      expect(conn.seen.slice(firstCommit + 1, firstCommit + 3)).toEqual([
+        "ROLLBACK",
+        "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY",
+      ]);
+
+      const reference = inMemoryReference([{ n: 1 }, { n: 2 }]);
+      const view = await committed();
+      expect(recordsOf(view)).toEqual(reference.records);
+      expect(view.runtime).toEqual({ now_ms: "30", next_sequence: "2", random_snapshot: JSON.stringify(reference.random) });
+      expect(view.items.map((r) => [r.work_id, r.status, r.completed_at_ms])).toEqual([
+        ["w1", "completed", "10"],
+        ["w2", "completed", "20"],
+      ]);
+      expect(runtime.read(a, "count")).toBe(2);
+      expect(runtime.randomSnapshot()).toEqual(reference.random);
+
+      // Resubmitting either request, here or through a new runtime on another connection, changes nothing.
+      const reloaded = await loadPostgresOperationRuntime(await driver());
+      for (const scheduler of [runtime.scheduler, reloaded.scheduler]) {
+        expect(await scheduler.schedule(work("w1", 10, a, { n: 1 }))).toBe("already-completed");
+        await expect(scheduler.schedule(work("w1", 10, a, { n: 9 }))).rejects.toThrow("has already completed");
+      }
+      expect(await reloaded.scheduler.advanceTo(simTime(30), 10, through(reloaded, handler))).toMatchObject({ executed: 0 });
+      expect(calls).toHaveLength(2);
+      expect(await committed()).toEqual(view);
+      expect(reloaded.read(a, "count")).toBe(2);
+    });
+
+    test("a lost COMMIT that did not commit leaves the item pending, unexecuted, and runnable once on request", async () => {
       await reset(0);
-      const unsent = faulty(await driver());
-      const blocked = await loadPostgresOperationRuntime(unsent.client);
-      await blocked.scheduler.schedule(work("w", 10));
-      const beforeUnsent = await committed();
-      unsent.arm({ when: (t) => t === "COMMIT", phase: "before" });
-      await expect(blocked.scheduler.advanceTo(simTime(20), 10, through(blocked))).rejects.toBeInstanceOf(
-        CommitOutcomeUnknownError,
-      );
-      expect(unsent.seen.slice(-2)).toEqual(["COMMIT", "ROLLBACK"]);
-      expect(await committed()).toEqual(beforeUnsent);
+      const conn = faulty(await driver());
+      const runtime = await loadPostgresOperationRuntime(conn.client);
+      await runtime.scheduler.schedule(work("w1", 10, a, { n: 1 }));
+      await runtime.scheduler.schedule(work("w2", 20, a, { n: 2 }));
+      const before = await committed();
+      const { calls, handler } = counted();
+      conn.seen.length = 0;
+      // The COMMIT never reaches the server, so ROLLBACK ends the open transaction.
+      conn.arm({ when: (t) => t === "COMMIT", phase: "before", error: () => new Error("Connection terminated unexpectedly") });
 
-      // The connection is really lost during COMMIT: here it did not commit, but the client cannot tell.
+      const failure = await runtime.scheduler.advanceTo(simTime(30), 10, through(runtime, handler)).catch((e: unknown) => e);
+      expect(failure).toBeInstanceOf(CommitNotConfirmedError);
+      expect((failure as Error).cause).toMatchObject({ message: "Connection terminated unexpectedly" });
+      // Nothing of the attempt is durable, the clock included, and the later item did not run.
+      expect(calls).toEqual(['{"n":1}']);
+      expect(await committed()).toEqual(before);
+      expect(before.items.map((r) => [r.work_id, r.status])).toEqual([
+        ["w1", "pending"],
+        ["w2", "pending"],
+      ]);
+      expect(runtime.read(a, "count")).toBeUndefined();
+      expect(runtime.randomSnapshot()).toEqual(createSeededRandom(SEED).snapshot());
+      expect(await runtime.scheduler.schedule(work("w1", 10, a, { n: 1 }))).toBe("already-pending");
+
+      // An explicit advance runs each item once, with the draws the lost attempt would have made.
+      expect(await runtime.scheduler.advanceTo(simTime(30), 10, through(runtime, handler))).toMatchObject({ executed: 2 });
+      expect(calls).toEqual(['{"n":1}', '{"n":1}', '{"n":2}']);
+      const reference = inMemoryReference([{ n: 1 }, { n: 2 }]);
+      expect(recordsOf(await committed())).toEqual(reference.records);
+      expect((await committed()).runtime.random_snapshot).toBe(JSON.stringify(reference.random));
+      expect(runtime.randomSnapshot()).toEqual(reference.random);
+    });
+
+    /** After a lost reply to a real commit, the observer changes the committed receipt before it is read. */
+    const lostThenAltered = (statement: string) => [lostReply(() => observer.query(statement))];
+    const unresolved: [string, () => Fault[]][] = [
+      ["the ROLLBACK before the read fails", () => [lostReply(), { when: (t) => t === "ROLLBACK", phase: "before" }]],
+      [
+        "the read fails",
+        () => [lostReply(), { when: (t) => t.startsWith("BEGIN ISOLATION LEVEL REPEATABLE READ"), phase: "before" }],
+      ],
+      ["the receipt query fails", () => [lostReply(), { when: receiptRead, phase: "after" }]],
+      [
+        "the read is not in a fresh transaction",
+        () => [lostReply(), { when: (t) => t.includes("pg_current_xact_id_if_assigned"), phase: "tamper", rows: () => [{ xid: "1" }] }],
+      ],
+      ["the work item is missing", () => lostThenAltered("DELETE FROM realmlib.work_items WHERE work_id = 'w1'")],
+      [
+        "the receipt holds a different request",
+        () => lostThenAltered(`UPDATE realmlib.work_items SET payload = '{"n":2}' WHERE work_id = 'w1'`),
+      ],
+      [
+        "the receipt is unreadable",
+        () => lostThenAltered(`UPDATE realmlib.work_items SET payload = '{"n":-0}' WHERE work_id = 'w1'`),
+      ],
+      [
+        "the receipt has another completion time",
+        () => lostThenAltered("UPDATE realmlib.work_items SET completed_at_ms = 11 WHERE work_id = 'w1'"),
+      ],
+      [
+        // The transaction never committed; a fixture rewrites the pending row as it is read.
+        "the item is pending with a different request",
+        () => [
+          { when: (t) => t === "COMMIT", phase: "before" },
+          { when: receiptRead, phase: "tamper", rows: (rows) => rows.map((r) => ({ ...r, operation: "op-y" })) },
+        ],
+      ],
+    ];
+    for (const [situation, faults] of unresolved) {
+      test(`an unknown COMMIT outcome fails closed when ${situation}`, async () => {
+        await reset(0);
+        const conn = faulty(await driver());
+        const runtime = await loadPostgresOperationRuntime(conn.client);
+        await runtime.scheduler.schedule(work("w1", 10, a, { n: 1 }));
+        await runtime.scheduler.schedule(work("w2", 20, a, { n: 2 }));
+        const { calls, handler } = counted();
+        conn.arm(...faults());
+        const failure = await runtime.scheduler.advanceTo(simTime(30), 10, through(runtime, handler)).catch((e: unknown) => e);
+        expect(failure).toBeInstanceOf(CommitOutcomeUnknownError);
+        expect((failure as Error).cause).toBeInstanceOf(Error);
+        // Neither claimed as completed nor executed again, and the later item did not run.
+        expect(calls).toEqual(['{"n":1}']);
+        expect(() => runtime.read(a, "count")).toThrow("unusable");
+        expect(() => runtime.randomSnapshot()).toThrow("unusable");
+        await expect(runtime.scheduler.now()).rejects.toThrow("unusable");
+        await expect(runtime.scheduler.schedule(work("w3", 40))).rejects.toThrow("unusable");
+        await expect(runtime.scheduler.advanceTo(simTime(30), 1, through(runtime, handler))).rejects.toThrow("unusable");
+        expect(calls).toHaveLength(1);
+        expect((await committed()).items.find((r) => r.work_id === "w2")).toMatchObject({ status: "pending" });
+      });
+    }
+
+    test("an unknown COMMIT outcome fails closed when the connection is really lost", async () => {
+      // Here the transaction did not commit, but with the connection gone the runtime cannot tell.
       await reset(0);
       const target = await driver();
       const pid = (await target.query("SELECT pg_backend_pid() AS pid")).rows[0].pid;
       // Once armed, terminates the driver's backend from the observer just before COMMIT is sent.
       let terminate = false;
+      const seen: string[] = [];
       const terminating: PostgresQueryable = {
         async query(text, values) {
+          seen.push(text);
           if (terminate && text === "COMMIT") await observer.query("SELECT pg_terminate_backend($1, 5000)", [pid]);
           return target.query(text, values);
         },
       };
-      const second = await loadPostgresOperationRuntime(terminating);
-      await second.scheduler.schedule(work("w", 10));
+      const runtime = await loadPostgresOperationRuntime(terminating);
+      await runtime.scheduler.schedule(work("w", 10));
+      const { calls, handler } = counted();
       terminate = true;
+      seen.length = 0;
       const before = await committed();
-      const outcome = await second.scheduler.advanceTo(simTime(20), 10, through(second)).catch((e: unknown) => e);
-      expect(outcome).toBeInstanceOf(CommitOutcomeUnknownError);
+      const failure = await runtime.scheduler.advanceTo(simTime(20), 10, through(runtime, handler)).catch((e: unknown) => e);
+      expect(failure).toBeInstanceOf(CommitOutcomeUnknownError);
+      expect((failure as Error).message).toContain("could not be read");
+      expect(calls).toHaveLength(1);
+      // Sent once, never retried; the ROLLBACK that follows fails on the dead connection, so nothing is read.
+      expect(seen.filter((t) => t === "COMMIT")).toHaveLength(1);
+      expect(seen.at(-1)).toBe("ROLLBACK");
       expect(await committed()).toEqual(before);
-      expect(() => second.read(a, "count")).toThrow("unusable");
+      expect(() => runtime.read(a, "count")).toThrow("unusable");
+
+      // A new runtime on a new connection reads the durable truth: still pending, run on request.
+      const fresh = await loadPostgresOperationRuntime(await driver());
+      expect(await fresh.scheduler.schedule(work("w", 10))).toBe("already-pending");
+      expect(await fresh.scheduler.advanceTo(simTime(20), 10, through(fresh, handler))).toMatchObject({ executed: 1 });
+      expect(calls).toHaveLength(2);
+      expect(fresh.read(a, "count")).toBe(1);
     });
   });
 }

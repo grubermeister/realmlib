@@ -17,7 +17,7 @@ import { copyState } from "./in-memory-state.ts";
 import { createSeededRandom } from "./seeded-random.ts";
 import type { RandomSnapshot } from "./seeded-random.ts";
 import { validateOperationName, validatePositiveCount, validateRequest, validateSequence } from "./scheduler.ts";
-import type { SchedulerStorage, StoredWork, WorkIdStatus } from "./scheduler.ts";
+import type { SchedulerStorage, StoredWork, WorkIdStatus, WorkRecord } from "./scheduler.ts";
 import { simTime as toSimTime } from "./sim-time.ts";
 import type { SimTime } from "./sim-time.ts";
 
@@ -135,6 +135,43 @@ function storedWorkFromRow(row: Record<string, unknown>): StoredWork {
       }),
     },
   };
+}
+
+/** @internal A {@link WorkRecord} plus a receipt's `completed_at_ms`. */
+export interface PersistedWork extends WorkRecord {
+  /** The simulation clock when the work completed; `undefined` while pending. */
+  readonly completedAt: SimTime | undefined;
+}
+
+/**
+ * @internal Reads and validates the `work_items` row for `id`, pending or a
+ * completion receipt, or returns `undefined` if there is none.
+ */
+export async function readPersistedWork(db: PostgresQueryable, id: WorkItemId): Promise<PersistedWork | undefined> {
+  const workId = toWorkItemId(id);
+  const rows = await query(
+    db,
+    `SELECT work_id, at_ms::text AS at_ms, sequence::text AS sequence, module_id, operation,
+            payload_version::text AS payload_version, payload::text AS payload,
+            status, completed_at_ms::text AS completed_at_ms
+     FROM realmlib.work_items WHERE work_id = $1`,
+    [workId],
+  );
+  const [row] = rows;
+  if (row === undefined) return undefined;
+  if (rows.length !== 1) throw new Error(`Work item lookup returned ${rows.length} rows for one work ID`);
+  const work = storedWorkFromRow(row);
+  if (work.id !== workId) throw new TypeError(`Invalid persisted work_id: expected ${JSON.stringify(workId)}`);
+  const where = `work item ${JSON.stringify(workId)}`;
+  const status = persisted(`status of ${where}`, () => workIdStatus(row.status));
+  const completedAt = persisted(`completed_at_ms of ${where}`, () => {
+    if (status === "pending") {
+      if (row.completed_at_ms !== null) throw new TypeError("pending work must have no completion time");
+      return undefined;
+    }
+    return toSimTime(parseStoredInteger(row.completed_at_ms));
+  });
+  return { status, work, completedAt };
 }
 
 /**
@@ -335,6 +372,11 @@ export function createPostgresSchedulerStorage(client: PostgresQueryable): Sched
       const [row] = await query(db, "SELECT status FROM realmlib.work_items WHERE work_id = $1", [workId]);
       if (row === undefined) return undefined;
       return persisted("work_items.status", () => workIdStatus(row.status));
+    },
+
+    async readWork(id: WorkItemId) {
+      const found = await readPersistedWork(db, id);
+      return found === undefined ? undefined : { status: found.status, work: found.work };
     },
 
     async markCompleted(id: WorkItemId) {

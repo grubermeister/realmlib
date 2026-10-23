@@ -8,8 +8,8 @@
  */
 
 import { describe, expect, test } from "bun:test";
-import { createScheduler, moduleId, simTime, workItemId } from "../src/index.ts";
-import type { ModuleId, ScheduledWork, SchedulerStorage, SimTime, StoredWork, WorkItemId } from "../src/index.ts";
+import { WorkIdConflictError, createScheduler, moduleId, simTime, workItemId } from "../src/index.ts";
+import type { ModuleId, ScheduledWork, SchedulerStorage, SimTime, StateValue, StoredWork, WorkItemId } from "../src/index.ts";
 
 export type SchedulerStorageFactory = (initialTime: SimTime) => SchedulerStorage | Promise<SchedulerStorage>;
 
@@ -23,8 +23,8 @@ function stored(id: string, at: number, sequence: number, payload?: StoredWork["
   return { id: workItemId(id), at: simTime(at), sequence, request: request(payload) };
 }
 
-function work(id: string, at: number): ScheduledWork {
-  return { id: workItemId(id), at: simTime(at), request: request() };
+function work(id: string, at: number, payload?: StoredWork["request"]["payload"]): ScheduledWork {
+  return { id: workItemId(id), at: simTime(at), request: request(payload) };
 }
 
 /** Bypasses static types to exercise runtime validation. */
@@ -34,6 +34,29 @@ function loose<T>(value: unknown): T {
 
 async function dueIds(storage: SchedulerStorage, until = Number.MAX_SAFE_INTEGER, limit = 1_000): Promise<string[]> {
   return (await storage.readDue(simTime(until), limit)).map((w) => w.id);
+}
+
+/** Everything a scheduler can observe in storage, for checking that a call changed nothing. */
+async function snapshot(storage: SchedulerStorage, ids: string[]) {
+  return {
+    clock: await storage.readClock(),
+    nextSequence: await storage.readNextSequence(),
+    pending: await storage.countPending(),
+    due: await storage.readDue(simTime(Number.MAX_SAFE_INTEGER), 1_000),
+    records: await Promise.all(ids.map((id) => storage.readWork(workItemId(id)))),
+  };
+}
+
+/** Variants of `base` that differ in exactly one identity-bearing field. */
+function conflicting(base: ScheduledWork): [string, ScheduledWork][] {
+  const { request } = base;
+  return [
+    ["time", { ...base, at: simTime(base.at + 1) }],
+    ["module", { ...base, request: { ...request, moduleId: moduleId("module-b") } }],
+    ["operation", { ...base, request: { ...request, operation: "op-y" } }],
+    ["payload version", { ...base, request: { ...request, payloadVersion: 2 } }],
+    ["payload", { ...base, request: { ...request, payload: { n: 2 } } }],
+  ];
 }
 
 async function runAll(storage: SchedulerStorage, target: number, max = 1_000): Promise<string[]> {
@@ -184,7 +207,7 @@ export function describeSchedulerStorageContract(name: string, create: Scheduler
       const storage = await fresh();
       const scheduler = createScheduler(storage);
       await scheduler.schedule(work("w1", 20));
-      await expect(scheduler.schedule(work("w1", 20))).rejects.toThrow("is already pending");
+      await expect(scheduler.schedule(work("w1", 21))).rejects.toThrow("is already pending");
       await scheduler.schedule(work("w2", 10));
       expect((await storage.readDue(simTime(100), 10)).map((w): [string, number] => [w.id, w.sequence])).toEqual([
         ["w2", 1],
@@ -306,6 +329,132 @@ export function describeSchedulerStorageContract(name: string, create: Scheduler
       const emoji = { id: workItemId("w\ud83d\ude00"), at: simTime(0), request: { ...request(), operation: "op\ud83d\ude00" } };
       await scheduler.schedule(emoji);
       expect(await storage.readDue(simTime(0), 1)).toEqual([{ ...emoji, sequence: 0 }]);
+    });
+  });
+
+  describe(`${name}: work identity and resubmission`, () => {
+    test("readWork returns pending work and, after completion, its original request, as copies", async () => {
+      const storage = await fresh();
+      expect(await storage.readWork(workItemId("w1"))).toBeUndefined();
+      await storage.insertPending(stored("w1", 10, 0, { list: [1], nested: { k: "v" } }), 1);
+      const pending = await storage.readWork(workItemId("w1"));
+      expect(pending).toEqual({ status: "pending", work: stored("w1", 10, 0, { list: [1], nested: { k: "v" } }) });
+      (pending!.work.request.payload as { list: number[] }).list.push(2);
+
+      await storage.writeClock(simTime(10));
+      await storage.markCompleted(workItemId("w1"));
+      expect(await storage.readWork(workItemId("w1"))).toEqual({
+        status: "completed",
+        work: stored("w1", 10, 0, { list: [1], nested: { k: "v" } }),
+      });
+      expect(await storage.readWork(workItemId("W1"))).toBeUndefined();
+    });
+
+    test("an identical pending resubmission is a no-op that keeps the original sequence and position", async () => {
+      const storage = await fresh();
+      const scheduler = createScheduler(storage);
+      expect(await scheduler.schedule(work("w1", 20))).toBe("accepted");
+      expect(await scheduler.schedule(work("w2", 20))).toBe("accepted");
+      const before = await snapshot(storage, ["w1", "w2"]);
+      expect(await scheduler.schedule(work("w1", 20))).toBe("already-pending");
+      expect(await createScheduler(storage).schedule(work("w1", 20))).toBe("already-pending");
+      expect(await snapshot(storage, ["w1", "w2"])).toEqual(before);
+      expect(before.nextSequence).toBe(2);
+      expect(await runAll(storage, 20)).toEqual(["w1", "w2"]);
+    });
+
+    test("different work under a pending ID is rejected as a conflict and changes nothing", async () => {
+      const storage = await fresh();
+      const scheduler = createScheduler(storage);
+      const original = work("w1", 20);
+      await scheduler.schedule(original);
+      const before = await snapshot(storage, ["w1"]);
+      for (const [field, variant] of conflicting(original)) {
+        const failure = await scheduler.schedule(variant).catch((e: unknown) => e);
+        expect({ field, failure }).toEqual({ field, failure: expect.any(WorkIdConflictError) });
+        expect((failure as WorkIdConflictError).status).toBe("pending");
+        expect((failure as Error).message).toContain("is already pending");
+      }
+      expect(await snapshot(storage, ["w1"])).toEqual(before);
+      expect(await scheduler.schedule(original)).toBe("already-pending");
+    });
+
+    test("an identical completed resubmission is recognized without running or changing anything, across schedulers", async () => {
+      const storage = await fresh();
+      const first = createScheduler(storage);
+      const original = work("done", 10);
+      await first.schedule(original);
+      await first.schedule(work("later", 30));
+      expect(await runAll(storage, 20)).toEqual(["done"]);
+      const before = await snapshot(storage, ["done", "later"]);
+      expect(before.clock).toBe(simTime(20));
+
+      for (const scheduler of [first, createScheduler(storage)]) {
+        // Its time is now in the past; that does not matter for a recognized retry.
+        expect(await scheduler.schedule(original)).toBe("already-completed");
+        for (const [field, variant] of conflicting(original)) {
+          const failure = await scheduler.schedule(variant).catch((e: unknown) => e);
+          expect({ field, failure }).toEqual({ field, failure: expect.any(WorkIdConflictError) });
+          expect((failure as WorkIdConflictError).status).toBe("completed");
+          expect((failure as Error).message).toContain("has already completed");
+        }
+      }
+      expect(await snapshot(storage, ["done", "later"])).toEqual(before);
+      expect(await runAll(storage, 20)).toEqual([]);
+      expect(await runAll(storage, 30)).toEqual(["later"]);
+    });
+
+    test("payload identity is structural: key order does not matter, any nested difference does", async () => {
+      const storage = await fresh();
+      const scheduler = createScheduler(storage);
+      const payload: StateValue = { a: 1, b: { c: [1, { d: "x", e: null }], f: true }, g: [] };
+      await scheduler.schedule(work("w1", 10, payload));
+      const before = await snapshot(storage, ["w1"]);
+
+      const reordered = { g: [], b: { f: true, c: [1, { e: null, d: "x" }] }, a: 1 };
+      expect(await scheduler.schedule(work("w1", 10, reordered))).toBe("already-pending");
+      const nullPrototype = Object.assign(Object.create(null) as Record<string, StateValue>, payload);
+      expect(await scheduler.schedule(work("w1", 10, nullPrototype))).toBe("already-pending");
+
+      const different: StateValue[] = [
+        { a: 1, b: { c: [1, { d: "y", e: null }], f: true }, g: [] },
+        { a: 1, b: { c: [1, { d: "x", e: false }], f: true }, g: [] },
+        { a: 1, b: { c: [{ d: "x", e: null }, 1], f: true }, g: [] },
+        { a: 1, b: { c: [1, { d: "x" }], f: true }, g: [] },
+        { a: 1, b: { c: [1, { d: "x", e: null, z: null }], f: true }, g: [] },
+        { a: "1", b: { c: [1, { d: "x", e: null }], f: true }, g: [] },
+        { a: 1, b: { c: [1, { d: "x", e: null }], f: true }, g: {} },
+        { a: 1, b: { c: { 0: 1, 1: { d: "x", e: null } }, f: true }, g: [] },
+        { a: 1, b: { c: [1, { d: "x", e: null }], f: true } },
+        [payload],
+        null,
+      ];
+      for (const variant of different) {
+        await expect(scheduler.schedule(work("w1", 10, variant))).rejects.toBeInstanceOf(WorkIdConflictError);
+      }
+      expect(await snapshot(storage, ["w1"])).toEqual(before);
+    });
+
+    test("invalid resubmissions, including nested -0, are rejected by validation before any identity match", async () => {
+      const storage = await fresh();
+      const scheduler = createScheduler(storage);
+      await scheduler.schedule(work("w1", 0, { list: [0, 1] }));
+      await scheduler.schedule(work("w2", 0, 0));
+      const before = await snapshot(storage, ["w1", "w2"]);
+      // Each would serialize to the stored JSON or compare equal with ===, if validation ran later.
+      const invalid: [ScheduledWork, new (...args: never[]) => Error][] = [
+        [work("w1", 0, { list: [-0, 1] }), TypeError],
+        [work("w2", 0, -0), TypeError],
+        [work("w1", 0, { list: [0, 1], extra: loose<StateValue>(undefined) }), TypeError],
+        [{ ...work("w1", 0, { list: [0, 1] }), at: loose<SimTime>(-0) }, RangeError],
+        [{ ...work("w1", 0, { list: [0, 1] }), request: { ...request({ list: [0, 1] }), payloadVersion: -0 } }, RangeError],
+        // Valid, and not trimmed to match: text is compared exactly.
+        [{ ...work("w1", 0, { list: [0, 1] }), request: { ...request({ list: [0, 1] }), operation: " op-x" } }, WorkIdConflictError],
+      ];
+      for (const [variant, error] of invalid) {
+        await expect(scheduler.schedule(variant)).rejects.toBeInstanceOf(error);
+      }
+      expect(await snapshot(storage, ["w1", "w2"])).toEqual(before);
     });
   });
 }

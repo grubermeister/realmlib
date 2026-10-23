@@ -11,7 +11,7 @@
 
 import { moduleId as toModuleId, textStorageProblem, workItemId as toWorkItemId } from "./identifiers.ts";
 import type { WorkItemId } from "./identifiers.ts";
-import { copyState } from "./in-memory-state.ts";
+import { copyState, sameState } from "./in-memory-state.ts";
 import type { StateValue } from "./in-memory-state.ts";
 import type { OperationRequest } from "./module-registry.ts";
 import { simTime as toSimTime } from "./sim-time.ts";
@@ -36,9 +36,37 @@ export interface StoredWork {
 /** Whether a work ID is occupied by pending work, by a completion receipt, or not at all. */
 export type WorkIdStatus = "pending" | "completed" | undefined;
 
+/** The work stored under an occupied ID: pending work, or the original work of a completion receipt. */
+export interface WorkRecord {
+  readonly status: Exclude<WorkIdStatus, undefined>;
+  readonly work: StoredWork;
+}
+
+/**
+ * How `schedule()` treated a request: `"accepted"` queued it as new work;
+ * `"already-pending"` and `"already-completed"` found an identical request
+ * already stored under its ID and changed nothing.
+ */
+export type ScheduleOutcome = "accepted" | "already-pending" | "already-completed";
+
+/**
+ * `schedule()` was given a work ID that is already pending or completed with a
+ * different request. Nothing was changed. Work IDs are never reused.
+ */
+export class WorkIdConflictError extends Error {
+  override readonly name = "WorkIdConflictError";
+  /** Whether the stored work with this ID is pending or completed. */
+  readonly status: Exclude<WorkIdStatus, undefined>;
+
+  constructor(message: string, status: Exclude<WorkIdStatus, undefined>) {
+    super(message);
+    this.status = status;
+  }
+}
+
 /**
  * Storage for one scheduler's clock, ordering sequence, pending work, and
- * completed work IDs. It provides data access and mutation only: ordering and
+ * completion receipts (each keeping its original work). It provides data access and mutation only: ordering and
  * advancement policy belong to {@link createScheduler}.
  *
  * Every method returns a Promise so implementations may perform asynchronous
@@ -77,6 +105,12 @@ export interface SchedulerStorage {
   readWorkIdStatus(id: WorkItemId): Promise<WorkIdStatus>;
 
   /**
+   * The pending work stored under `id`, or the original work of its completion
+   * receipt, exactly as inserted; `undefined` if `id` is unused.
+   */
+  readWork(id: WorkItemId): Promise<WorkRecord | undefined>;
+
+  /**
    * Removes the pending item `id` and records its ID as completed, permanently.
    *
    * @throws if `id` is not pending.
@@ -112,16 +146,21 @@ export interface Scheduler {
   pendingCount(): Promise<number>;
 
   /**
-   * Queues a snapshot of `work`, taken when called. Its request envelope is
-   * checked structurally only; the operation need not be registered. The
-   * payload must be a {@link StateValue}. Invalid input changes nothing.
-   * Calls take effect one at a time, in call order.
+   * Queues a snapshot of `work`, taken when called, and resolves to
+   * `"accepted"`. Its request envelope is checked structurally only; the
+   * operation need not be registered. The payload must be a {@link StateValue}.
+   * Invalid input changes nothing. Calls take effect one at a time, in call order.
+   *
+   * Resubmitting the work stored under an ID (same time, module, operation,
+   * payload version, and structurally equal payload) is harmless: it changes
+   * nothing and resolves to `"already-pending"` or `"already-completed"`.
    *
    * @throws {TypeError | RangeError} if the ID, time, or request is invalid.
-   * @throws {RangeError} if `work.at` is earlier than `now()`.
-   * @throws {Error} if an item with the same ID is pending or has completed, or `advanceTo()` is running.
+   * @throws {WorkIdConflictError} if different work with the same ID is pending or has completed.
+   * @throws {RangeError} if the ID is new and `work.at` is earlier than `now()`.
+   * @throws {Error} if `advanceTo()` is running.
    */
-  schedule(work: ScheduledWork): Promise<void>;
+  schedule(work: ScheduledWork): Promise<ScheduleOutcome>;
 
   /**
    * Runs pending items due at or before `target`, in order of time and then
@@ -214,6 +253,22 @@ export function validatePositiveCount(value: unknown, name: string): number {
   return value;
 }
 
+/**
+ * @internal Whether two validated work items are the same request: equal ID,
+ * time, module, operation, payload version, and structurally equal payload.
+ * The sequence is assigned by storage, not requested, so it is not compared.
+ */
+export function sameWork(x: Omit<StoredWork, "sequence">, y: Omit<StoredWork, "sequence">): boolean {
+  return (
+    x.id === y.id &&
+    x.at === y.at &&
+    x.request.moduleId === y.request.moduleId &&
+    x.request.operation === y.request.operation &&
+    x.request.payloadVersion === y.request.payloadVersion &&
+    sameState(x.request.payload, y.request.payload)
+  );
+}
+
 /** A fresh copy of stored work for a callback, so the callback cannot alter the queue. */
 function copyForCallback(work: StoredWork): ScheduledWork {
   const { moduleId, operation, payloadVersion, payload } = work.request;
@@ -244,7 +299,7 @@ export function createScheduler(storage: SchedulerStorage): Scheduler {
     return storage.countPending();
   }
 
-  function schedule(work: ScheduledWork): Promise<void> {
+  function schedule(work: ScheduledWork): Promise<ScheduleOutcome> {
     let id: WorkItemId;
     let at: SimTime;
     let request: StoredWork["request"];
@@ -262,20 +317,28 @@ export function createScheduler(storage: SchedulerStorage): Scheduler {
     } catch (error) {
       return Promise.reject(error);
     }
-    return exclusive(async () => {
+    return exclusive(async (): Promise<ScheduleOutcome> => {
+      // Before the time check: an identical retry of completed work is usually in the past.
+      const existing = await storage.readWork(id);
+      if (existing !== undefined) {
+        if (sameWork(existing.work, { id, at, request })) {
+          return existing.status === "pending" ? "already-pending" : "already-completed";
+        }
+        throw new WorkIdConflictError(
+          existing.status === "pending"
+            ? `Work item ${JSON.stringify(id)} is already pending with a different request`
+            : `Work item ${JSON.stringify(id)} has already completed with a different request; work IDs cannot be reused`,
+          existing.status,
+        );
+      }
       const current = await storage.readClock();
       if (at < current) {
         throw new RangeError(`Cannot schedule work at ${at}, earlier than the current time ${current}`);
       }
-      const status = await storage.readWorkIdStatus(id);
-      if (status === "pending") {
-        throw new Error(`Work item ${JSON.stringify(id)} is already pending`);
-      }
-      if (status === "completed") {
-        throw new Error(`Work item ${JSON.stringify(id)} has already completed; work IDs cannot be reused`);
-      }
       const sequence = await storage.readNextSequence();
+      // insertPending() still rejects an occupied ID itself; the read above only classifies retries.
       await storage.insertPending({ id, at, sequence, request }, sequence + 1);
+      return "accepted";
     });
   }
 

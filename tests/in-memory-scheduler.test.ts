@@ -168,8 +168,10 @@ describe("scheduling", () => {
         throw new Error("fail");
       }),
     ).rejects.toThrow("fail");
-    await expect(scheduler.schedule(work("w1", 5))).rejects.toThrow("is already pending");
+    expect(await scheduler.schedule(work("w1", 5))).toBe("already-pending");
+    await expect(scheduler.schedule(work("w1", 6))).rejects.toThrow("is already pending");
     expect((await runAll(scheduler, 5)).ids).toEqual(["w1"]);
+    expect(await scheduler.schedule(work("w1", 5))).toBe("already-completed");
     await expect(scheduler.schedule(work("w1", 6))).rejects.toThrow("has already completed");
   });
 
@@ -178,8 +180,10 @@ describe("scheduling", () => {
     await scheduler.schedule(work("w1", 5));
     await scheduler.schedule(work("w2", 5));
     expect((await runAll(scheduler, 5, 1)).ids).toEqual(["w1"]);
-    await expect(scheduler.schedule(work("w1", 5))).rejects.toThrow("has already completed");
-    await expect(scheduler.schedule(work("w2", 5))).rejects.toThrow("is already pending");
+    expect(await scheduler.schedule(work("w1", 5))).toBe("already-completed");
+    expect(await scheduler.schedule(work("w2", 5))).toBe("already-pending");
+    await expect(scheduler.schedule(work("w1", 5, { payload: 2 }))).rejects.toThrow("has already completed");
+    await expect(scheduler.schedule(work("w2", 5, { payload: 2 }))).rejects.toThrow("is already pending");
     expect((await runAll(scheduler, 5)).ids).toEqual(["w2"]);
   });
 
@@ -187,7 +191,8 @@ describe("scheduling", () => {
     const scheduler = createInMemoryScheduler();
     await scheduler.schedule(work("w1", 5));
     await expect(scheduler.schedule(work("bad", 5, { operation: " " }))).rejects.toThrow();
-    await expect(scheduler.schedule(work("w1", 5))).rejects.toThrow();
+    await expect(scheduler.schedule(work("w1", 5, { payload: 2 }))).rejects.toThrow();
+    expect(await scheduler.schedule(work("w1", 5))).toBe("already-pending");
     await scheduler.schedule(work("w2", 5));
     await scheduler.schedule(work("w3", 5));
     expect((await runAll(scheduler, 5)).ids).toEqual(["w1", "w2", "w3"]);
@@ -609,7 +614,9 @@ describe("callback failure", () => {
         throw new Error("fail");
       }),
     ).rejects.toThrow("fail");
-    await expect(scheduler.schedule(work("w1", 10))).rejects.toThrow(Error);
+    await expect(scheduler.schedule(work("w1", 11))).rejects.toThrow(Error);
+    expect(await scheduler.schedule(work("w1", 10))).toBe("already-pending");
+    expect(await scheduler.pendingCount()).toBe(1);
   });
 
   test("Promise and thenable returns are rejected and keep the item pending", async () => {
@@ -698,7 +705,7 @@ describe("reentrancy", () => {
     const outer = createInMemoryScheduler();
     const inner = createInMemoryScheduler();
     await outer.schedule(work("w1", 10));
-    let scheduled: Promise<void> | undefined;
+    let scheduled: Promise<unknown> | undefined;
     await outer.advanceTo(simTime(10), 1, () => {
       scheduled = inner.schedule(work("w2", 0));
     });
@@ -710,10 +717,20 @@ describe("reentrancy", () => {
 describe("call ordering", () => {
   test("unawaited schedule() calls take effect in call order, before a later advanceTo()", async () => {
     const scheduler = createInMemoryScheduler();
-    const calls = [scheduler.schedule(work("w1", 10)), scheduler.schedule(work("w1", 10)), scheduler.schedule(work("w2", 10))];
+    const calls = [
+      scheduler.schedule(work("w1", 10)),
+      scheduler.schedule(work("w1", 10)),
+      scheduler.schedule(work("w1", 11)),
+      scheduler.schedule(work("w2", 10)),
+    ];
     const advanced = runAll(scheduler, 10);
     const settled = await Promise.allSettled(calls);
-    expect(settled.map((result) => result.status)).toEqual(["fulfilled", "rejected", "fulfilled"]);
+    expect(settled.map((result) => (result.status === "fulfilled" ? result.value : "rejected"))).toEqual([
+      "accepted",
+      "already-pending",
+      "rejected",
+      "accepted",
+    ]);
     expect((await advanced).ids).toEqual(["w1", "w2"]);
   });
 

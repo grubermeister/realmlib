@@ -114,13 +114,14 @@ export function createInMemorySchedulerStorage(initialTime: SimTime = toSimTime(
   let clock = toSimTime(initialTime);
   let nextSequence = 0;
   const queue = new MinHeap<StoredWork>(precedes);
-  const pendingIds = new Set<string>();
-  // Work IDs are unique for the storage's lifetime, so completed IDs are never forgotten.
-  const completedIds = new Set<string>();
+  const pending = new Map<string, StoredWork>();
+  // Work IDs are unique for the storage's lifetime, so completed work is never forgotten.
+  // Each receipt keeps its original work, so a resubmission can be compared with it.
+  const completed = new Map<string, StoredWork>();
 
   function status(id: string): WorkIdStatus {
-    if (pendingIds.has(id)) return "pending";
-    if (completedIds.has(id)) return "completed";
+    if (pending.has(id)) return "pending";
+    if (completed.has(id)) return "completed";
     return undefined;
   }
 
@@ -150,7 +151,7 @@ export function createInMemorySchedulerStorage(initialTime: SimTime = toSimTime(
         throw new RangeError(`Next sequence ${next} must be a safe integer above ${stored.sequence}`);
       }
       queue.push(stored);
-      pendingIds.add(stored.id);
+      pending.set(stored.id, stored);
       nextSequence = next;
     },
 
@@ -173,13 +174,20 @@ export function createInMemorySchedulerStorage(initialTime: SimTime = toSimTime(
       return status(id);
     },
 
+    async readWork(id: WorkItemId) {
+      const found = status(id);
+      if (found === undefined) return undefined;
+      return { status: found, work: copyWork((found === "pending" ? pending : completed).get(id)!) };
+    },
+
     async markCompleted(id: WorkItemId) {
-      if (!pendingIds.has(id)) {
+      const work = pending.get(id);
+      if (work === undefined) {
         throw new Error(`Work item ${JSON.stringify(id)} is not pending`);
       }
-      queue.removeAt(queue.indexOf((work) => work.id === id));
-      pendingIds.delete(id);
-      completedIds.add(id);
+      queue.removeAt(queue.indexOf((item) => item.id === id));
+      pending.delete(id);
+      completed.set(id, work);
     },
   };
 }

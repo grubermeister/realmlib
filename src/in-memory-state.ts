@@ -158,6 +158,26 @@ export function copyState(value: unknown, path = "value"): StateValue {
 }
 
 /**
+ * Whether two validated {@link StateValue}s are structurally equal: the same
+ * primitives, arrays with equal elements in order, and objects with the same
+ * own keys and equal values, regardless of key order or prototype (JSON
+ * distinguishes neither). Both must already be validated, so neither holds
+ * -0, non-finite numbers, or cycles. Package-internal.
+ */
+export function sameState(x: StateValue, y: StateValue): boolean {
+  if (typeof x !== "object" || x === null || typeof y !== "object" || y === null) return x === y;
+  if (Array.isArray(x) || Array.isArray(y)) {
+    if (!Array.isArray(x) || !Array.isArray(y) || x.length !== y.length) return false;
+    return x.every((item, index) => sameState(item, y[index]!));
+  }
+  const xs = x as { readonly [key: string]: StateValue };
+  const ys = y as { readonly [key: string]: StateValue };
+  const keys = Object.keys(xs);
+  if (keys.length !== Object.keys(ys).length) return false;
+  return keys.every((key) => Object.hasOwn(ys, key) && sameState(xs[key]!, ys[key]!));
+}
+
+/**
  * A staged, single-module view of a store. Writes through `access` go to a
  * private overlay until `commit()` publishes them; `end()` invalidates `access`.
  * Package-internal: not exported from the package root.

@@ -568,7 +568,9 @@ test("the store's public surface is unchanged", () => {
 test("internal staging helpers are not exported from the package root", async () => {
   const exported = Object.keys(await import("../src/index.ts")).sort();
   expect(exported).toEqual([
+    "CommitNotConfirmedError",
     "CommitOutcomeUnknownError",
+    "WorkIdConflictError",
     "createInMemoryScheduler",
     "createInMemorySchedulerStorage",
     "createInMemoryStateStore",

@@ -237,10 +237,9 @@ result; // { now: 5000, executed: 1, reachedTarget: true }
   request envelope (module ID, nonblank storable operation name, positive safe-integer
   version) and stores a **copy**, taken when `schedule()` is called. The payload
   must be a `StateValue` (see [In-memory module state](#in-memory-module-state)).
-  Validation is structural only: the registry is not consulted. Work IDs are
-  **unique for the storage's lifetime**: an ID may not be reused while it is
-  pending or after it has completed (storage remembers every completed ID).
-  Invalid input or a duplicate rejects and changes nothing.
+  Validation is structural only: the registry is not consulted. Invalid input
+  rejects and changes nothing. It resolves to a `ScheduleOutcome` (see
+  [Resubmitting work](#resubmitting-work)).
 - `schedule()` and `advanceTo()` calls on one scheduler take effect one at a
   time, in call order, so unawaited `schedule()` calls keep their call order.
   `now()` and `pendingCount()` read storage directly and see only calls that
@@ -266,6 +265,42 @@ result; // { now: 5000, executed: 1, reachedTarget: true }
 - The scheduler does not choose handlers, call `executeInMemoryOperation()` for
   you, cancel work, or make queued work atomic with state changes.
 
+### Resubmitting work
+
+A `WorkItemId` names **one immutable work request for the storage's
+lifetime**. Submitting the same request again is safe, before or after it runs,
+so a caller that lost a `schedule()` reply can simply repeat it:
+
+| Stored under the ID | Same request | Different request |
+|---------------------|--------------|-------------------|
+| Nothing | resolves `"accepted"`: queued as new work | — |
+| Pending work | resolves `"already-pending"` | rejects `WorkIdConflictError` (`status: "pending"`) |
+| A completion receipt | resolves `"already-completed"` | rejects `WorkIdConflictError` (`status: "completed"`) |
+
+- **Same request** means the incoming work, after the usual validation, matches
+  what was stored when the ID was first accepted: the same `at`, `moduleId`,
+  `operation`, and `payloadVersion` (compared exactly, so `" op"` is not
+  `"op"`), and a structurally equal `payload`: object keys may be in any
+  order, but every nested value, array element order, and the
+  array/object distinction must match. The insertion sequence is assigned by
+  storage and is not compared.
+- Validation runs first, so invalid input (for example a nested `-0` where the
+  stored payload has `0`) rejects with `TypeError` or `RangeError`, never as a
+  match or a conflict.
+- A recognized repeat or a conflict **changes nothing**: no sequence is
+  consumed, the original item keeps its sequence and queue position, and a
+  receipt is not touched. The repeat of completed work is recognized even
+  though its time is now in the past, and its callback is not run again.
+- Storage still rejects inserting an occupied ID itself; the scheduler's
+  lookup only classifies repeats. One scheduler per storage is still assumed.
+
+**API change:** `schedule()` now resolves to `ScheduleOutcome`
+(`"accepted" | "already-pending" | "already-completed"`) instead of `void`,
+and an identical repeat now resolves instead of rejecting. A conflicting
+repeat still rejects, now with `WorkIdConflictError` (an `Error`; messages
+still say "is already pending" or "has already completed"). `SchedulerStorage`
+has a new required method, `readWork(id)` (below).
+
 **API change (from synchronous):** `schedule(work): void` →
 `Promise<void>`, `advanceTo(...): AdvanceResult` → `Promise<AdvanceResult>`,
 `now(): SimTime` → `Promise<SimTime>`, `pendingCount(): number` →
@@ -287,6 +322,7 @@ The scheduler owns ordering, validation, and advancement policy. A
 | `readDue(until, limit)` | At most `limit` pending items due at or before `until`, ordered by (`at`, `sequence`) |
 | `countPending()` | The number of pending items |
 | `readWorkIdStatus(id)` | `"pending"`, `"completed"`, or `undefined` |
+| `readWork(id)` | `{ status, work }`: the pending `StoredWork`, or the original work of a completion receipt; `undefined` if unused |
 | `markCompleted(id)` | Removes a pending item and keeps its ID as completed |
 
 - Every method returns a Promise. The scheduler validates values before writing
@@ -312,8 +348,8 @@ The scheduler owns ordering, validation, and advancement policy. A
   IDs; it does not reset them. Use one scheduler per storage at a time.
 - `createInMemorySchedulerStorage(initialTime?)` starts with the clock at
   `initialTime` (default `simTime(0)`), next sequence `0`, and no work. It keeps
-  only the IDs of completed work. Its data lives in that object and is never
-  persisted.
+  each completed item's original work as its receipt. Its data lives in that
+  object and is never persisted.
 - The fields correspond to `realmlib.runtime_state` (`now_ms`, `next_sequence`)
   and `realmlib.work_items` (`status` `'pending'` or `'completed'`; a completed
   item's time is the clock when it completed). See
@@ -435,7 +471,9 @@ await pool.end();
   `format_version` (only `1` is accepted), plus every column of `work_items`.
   `markCompleted()` sets `status = 'completed'` and `completed_at_ms` to the
   **stored simulation clock**, never wall time, and keeps the row as the
-  receipt, so its ID and sequence are never reused. `random_snapshot` and
+  receipt, so its ID and sequence are never reused. The receipt keeps every
+  request column, so `readWork()` returns the original request after
+  completion, also from a new adapter or process. `random_snapshot` and
   `state_records` are used only by the
   [operation runtime](#atomic-postgresql-operations).
 - `readDue()` is ordered by `(at_ms, sequence)` and limited in SQL.
@@ -459,8 +497,9 @@ await pool.end();
 - **Not atomic across an operation by itself.** Each method is one statement,
   atomic by itself. This storage alone does not commit an operation's state
   changes, random draws, queue change, and clock together; the
-  [operation runtime](#atomic-postgresql-operations) does. Safe retries are not
-  provided.
+  [operation runtime](#atomic-postgresql-operations) does. Resubmitting a
+  `schedule()` is safe (see [Resubmitting work](#resubmitting-work)); nothing
+  is retried automatically.
 - **One driver per database.** Use one scheduler against a given database at a
   time. This is a precondition; it is not enforced, and concurrent drivers are
   not arbitrated.
@@ -535,20 +574,49 @@ await client.end();
   separately. If `COMMIT` itself is rejected by the server (for example by a
   deferred constraint), nothing committed and the runtime stays usable.
 - **Unknown outcome:** if `COMMIT` fails without the server reporting an error
-  (for example the connection is lost), the runtime throws
-  `CommitOutcomeUnknownError` and refuses all further use, including `read()`
-  and its scheduler. It sends a `ROLLBACK`, which never commits, so a
-  transaction whose `COMMIT` never arrived releases its locks. It does **not**
-  retry or find out whether the item committed: check the database and load a
-  new runtime. A failed `ROLLBACK` likewise makes the runtime unusable.
+  (for example the reply is lost with the connection), that is not taken as a
+  rollback, and the staged effects are never published. The runtime sends
+  `ROLLBACK` (which never commits; it ends a transaction whose `COMMIT` never
+  arrived), then, on the same connection, reads the item's `work_items` row,
+  `state_records`, and `random_snapshot` in one read-only snapshot, checking
+  that it is not inside the item's transaction. It compares the row with the
+  work being executed (ID, time, sequence, module, operation, payload version,
+  and payload, as in [Resubmitting work](#resubmitting-work)):
+  - **Completed**, matching, with `completed_at_ms` at the item's time: the
+    item committed. The in-memory state and random stream are replaced by the
+    values just read, and `advanceTo()` continues with the next item. The
+    handler is not run again.
+  - **Pending**, matching: it did not commit. The in-memory views are replaced
+    by the values read (unchanged, since nothing committed), and `advanceTo()`
+    rejects with `CommitNotConfirmedError`, whose `cause` is the `COMMIT`
+    error. The item stays pending with the clock where it was before the item
+    (as for any database failure); it is **not** run again until you call
+    `advanceTo()` again. The runtime stays usable.
+  - **Anything else** (the `ROLLBACK` or the read fails, for example because
+    the connection is gone; the row is missing, unreadable, or holds a
+    different request or completion time): `CommitOutcomeUnknownError`, and
+    the runtime refuses all further use, including `read()` and its
+    scheduler. Load a new runtime on a working connection: it reads the
+    durable outcome, and resubmitting the request then reports
+    `"already-pending"` or `"already-completed"`. A failed `ROLLBACK` after a
+    handler failure likewise makes the runtime unusable.
+
+  There is no reconnection or retry loop: only the one connection the runtime
+  was given is used.
 - **One operation per item:** `runtime.execute()` works only inside a callback
   of `runtime.scheduler` (or another scheduler over `runtime.storage`), at most
   once per item. A callback that runs no operation completes with only its
   clock and receipt.
-- **Not covered:** external side effects of handlers, retries, crash recovery,
-  and concurrent drivers. Use one runtime per database at a time.
+- **Not covered:** external side effects of handlers (the database guarantee
+  covers only the simulation's database effects, not exactly-once delivery),
+  automatic retries, crash recovery, and concurrent drivers. Use one runtime
+  per database at a time.
 
 **API additions:** `loadPostgresOperationRuntime`, `PostgresOperationRuntime`,
 `CommitOutcomeUnknownError`; an optional `runWork()` on `SchedulerStorage`; an
 optional third `random` argument to `initializePostgresSchedulerStorage()`.
 Existing signatures and in-memory behavior are unchanged.
+
+**Later additions:** `CommitNotConfirmedError`; `CommitOutcomeUnknownError` is
+now thrown only when the durable record does not settle the outcome. See also
+the `schedule()` changes under [Resubmitting work](#resubmitting-work).

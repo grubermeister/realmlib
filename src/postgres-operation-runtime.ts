@@ -5,8 +5,9 @@
  * The caller supplies and owns one dedicated connection. Loading reads the
  * committed module state and random snapshot into memory, because handlers read
  * state synchronously; those in-memory copies change only after a confirmed
- * `COMMIT`. Nothing here opens connections, applies migrations, retries, or
- * coordinates concurrent drivers.
+ * `COMMIT`. If a `COMMIT`'s outcome is unknown, the runtime reads the work
+ * item's durable receipt before going on. Nothing here opens connections,
+ * applies migrations, retries, or coordinates concurrent drivers.
  */
 
 import { stageOperation } from "./execute-in-memory-operation.ts";
@@ -14,29 +15,43 @@ import type { OperationHandler, StagedOperation } from "./execute-in-memory-oper
 import { moduleId as toModuleId } from "./identifiers.ts";
 import type { ModuleId } from "./identifiers.ts";
 import { createInMemoryStateStore } from "./in-memory-state.ts";
-import type { StateValue } from "./in-memory-state.ts";
+import type { InMemoryStateStore, StateValue } from "./in-memory-state.ts";
 import type { ModuleRegistry, OperationValidationResult } from "./module-registry.ts";
 import {
   createPostgresSchedulerStorage,
   missingRuntimeState,
   persisted,
   query,
+  readPersistedWork,
   readRuntimeText,
   validateClient,
 } from "./postgres-scheduler-storage.ts";
-import type { PostgresQueryable } from "./postgres-scheduler-storage.ts";
-import { createScheduler } from "./scheduler.ts";
+import type { PersistedWork, PostgresQueryable } from "./postgres-scheduler-storage.ts";
+import { createScheduler, sameWork } from "./scheduler.ts";
 import type { Scheduler, SchedulerStorage, StoredWork } from "./scheduler.ts";
 import { createSeededRandom } from "./seeded-random.ts";
 import type { RandomSnapshot, SeededRandom } from "./seeded-random.ts";
 
 /**
  * `COMMIT` failed in a way that does not show whether the transaction committed,
- * for example because the connection was lost. The runtime that threw it is
- * unusable afterwards; nothing is retried or resolved automatically.
+ * for example because the connection was lost, and reading the work item's
+ * durable record afterwards did not settle it: the read failed, or the record
+ * was missing, unreadable, or not the work being executed. The runtime that
+ * threw it is unusable afterwards; nothing is retried.
  */
 export class CommitOutcomeUnknownError extends Error {
   override readonly name = "CommitOutcomeUnknownError";
+}
+
+/**
+ * `COMMIT` failed without showing whether it committed, and the durable record
+ * then showed that it did not: the work item is still pending with its original
+ * request and has no receipt. Nothing of the attempt was kept, including its
+ * clock change. The item is not executed again automatically; a later
+ * `advanceTo()` runs it. The runtime stays usable.
+ */
+export class CommitNotConfirmedError extends Error {
+  override readonly name = "CommitNotConfirmedError";
 }
 
 export interface PostgresOperationRuntime {
@@ -87,6 +102,57 @@ function commitDefinitelyFailed(error: unknown): boolean {
   );
 }
 
+/**
+ * Reads the committed module state and random stream. The caller must hold a
+ * transaction so both come from one snapshot.
+ */
+async function readCommittedViews(
+  db: PostgresQueryable,
+): Promise<{ store: InMemoryStateStore; random: SeededRandom | undefined }> {
+  const store = createInMemoryStateStore();
+  let random: SeededRandom | undefined;
+  const snapshot = await readRuntimeText(db, "random_snapshot");
+  if (snapshot !== null) {
+    random = persisted("runtime_state.random_snapshot", () => {
+      if (typeof snapshot !== "string") throw new TypeError(`expected JSON text, received ${typeof snapshot}`);
+      const parsed: unknown = JSON.parse(snapshot);
+      if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+        throw new TypeError("expected a JSON object");
+      }
+      return createSeededRandom(parsed as RandomSnapshot);
+    });
+  }
+  const rows = await query(
+    db,
+    "SELECT module_id, record_key, value::text AS value FROM realmlib.state_records ORDER BY module_id, record_key",
+    [],
+  );
+  for (const row of rows) {
+    const where = `state record ${JSON.stringify(row.module_id)}/${JSON.stringify(row.record_key)}`;
+    persisted(where, () => {
+      if (typeof row.value !== "string") throw new TypeError(`expected JSON text, received ${typeof row.value}`);
+      // set() validates the module ID, key, and value (rejecting -0) and copies it.
+      const owner = toModuleId(row.module_id as string);
+      store.forModule(owner).set(row.record_key as string, JSON.parse(row.value));
+    });
+  }
+  return { store, random };
+}
+
+/** Runs `read` in one read-only snapshot transaction, rolling back if it fails. */
+async function readOnly<T>(db: PostgresQueryable, read: () => Promise<T>): Promise<T> {
+  await query(db, "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY", []);
+  try {
+    const result = await read();
+    await query(db, "COMMIT", []);
+    return result;
+  } catch (error) {
+    // The original error matters more than a failed cleanup.
+    await query(db, "ROLLBACK", []).catch(() => {});
+    throw error;
+  }
+}
+
 /** A `pg` `Pool` sends each statement to any idle connection, so it cannot hold a transaction. */
 function looksLikePool(client: object): boolean {
   return "totalCount" in client && "idleCount" in client;
@@ -97,7 +163,11 @@ function looksLikePool(client: object): boolean {
  * returns a runtime whose scheduler commits each successful work item in one
  * transaction: its clock, state-record changes, random stream position, and
  * completion receipt. A handler failure rolls that back, then sets the clock to
- * the item's time on its own, leaving the item pending.
+ * the item's time on its own, leaving the item pending. A `COMMIT` with an
+ * unknown outcome is settled from the item's durable record: a matching
+ * receipt continues, a matching pending item rejects with
+ * {@link CommitNotConfirmedError}, and anything else with
+ * {@link CommitOutcomeUnknownError}.
  *
  * `client` must be one dedicated connection, such as a `pg` `Client` or a
  * `PoolClient` held for the runtime's lifetime, not in a transaction, and not
@@ -114,41 +184,8 @@ export async function loadPostgresOperationRuntime(client: PostgresQueryable): P
     throw new TypeError("client must be one dedicated connection, such as a pg Client or PoolClient, not a Pool");
   }
 
-  const store = createInMemoryStateStore();
-  let random: SeededRandom | undefined;
-  await query(db, "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY", []);
-  try {
-    const snapshot = await readRuntimeText(db, "random_snapshot");
-    if (snapshot !== null) {
-      random = persisted("runtime_state.random_snapshot", () => {
-        if (typeof snapshot !== "string") throw new TypeError(`expected JSON text, received ${typeof snapshot}`);
-        const parsed: unknown = JSON.parse(snapshot);
-        if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
-          throw new TypeError("expected a JSON object");
-        }
-        return createSeededRandom(parsed as RandomSnapshot);
-      });
-    }
-    const rows = await query(
-      db,
-      "SELECT module_id, record_key, value::text AS value FROM realmlib.state_records ORDER BY module_id, record_key",
-      [],
-    );
-    for (const row of rows) {
-      const where = `state record ${JSON.stringify(row.module_id)}/${JSON.stringify(row.record_key)}`;
-      persisted(where, () => {
-        if (typeof row.value !== "string") throw new TypeError(`expected JSON text, received ${typeof row.value}`);
-        // set() validates the module ID, key, and value (rejecting -0) and copies it.
-        const owner = toModuleId(row.module_id as string);
-        store.forModule(owner).set(row.record_key as string, JSON.parse(row.value));
-      });
-    }
-    await query(db, "COMMIT", []);
-  } catch (error) {
-    // The original error matters more than a failed cleanup; the runtime is never returned.
-    await query(db, "ROLLBACK", []).catch(() => {});
-    throw error;
-  }
+  // In-memory copies of committed values, replaced wholesale when reconciliation reloads them.
+  let { store, random } = await readOnly(db, () => readCommittedViews(db));
 
   const base = createPostgresSchedulerStorage(db);
   /** Why the runtime can no longer be trusted, once it cannot. */
@@ -258,20 +295,74 @@ export async function loadPostgresOperationRuntime(client: PostgresQueryable): P
     try {
       await query(db, "COMMIT", []);
     } catch (error) {
+      // Staged values are never published after an uncertain COMMIT; the durable record decides.
       staged?.end();
       if (commitDefinitelyFailed(error)) throw error;
-      // Not a retry: ROLLBACK never commits. If COMMIT never arrived, it releases the
-      // transaction's locks; either way the outcome stays unknown.
-      await query(db, "ROLLBACK", []).catch(() => {});
-      broken = new CommitOutcomeUnknownError(
-        `COMMIT of work item ${JSON.stringify(work.id)} failed without showing whether it committed; ` +
-          "check the database before continuing with a new runtime",
-        { cause: error },
-      );
-      throw broken;
+      await reconcile(work, error);
+      return;
     }
     staged?.publish();
     staged?.end();
+  }
+
+  /**
+   * Settles a `COMMIT` whose outcome is unknown from the durable record of
+   * `work`, read on this connection after its transaction has ended. Returns
+   * if the matching receipt shows it committed; otherwise throws. Either way
+   * the in-memory views are first replaced by what is committed.
+   */
+  async function reconcile(work: StoredWork, commitError: unknown): Promise<void> {
+    const label = `COMMIT of work item ${JSON.stringify(work.id)}`;
+    let durable: Awaited<ReturnType<typeof readCommittedViews>> & { record: PersistedWork | undefined };
+    try {
+      // Not a retry: ROLLBACK never commits. If COMMIT never arrived, it ends the item's
+      // transaction. If it fails, the connection's transaction state is unknown, and a
+      // read could see the item's own uncommitted writes, so nothing is read.
+      await query(db, "ROLLBACK", []);
+      durable = await readOnly(db, async () => {
+        // Backstop: a transaction that has written anything has an ID, so this is not the item's.
+        const [own] = await query(db, "SELECT pg_current_xact_id_if_assigned()::text AS xid", []);
+        if (own === undefined || own.xid !== null) {
+          throw new Error("the read is not in a fresh read-only transaction");
+        }
+        const record = await readPersistedWork(db, work.id);
+        return { record, ...(await readCommittedViews(db)) };
+      });
+    } catch (error) {
+      broken = new CommitOutcomeUnknownError(
+        `${label} failed without showing whether it committed, and its durable record could not be read ` +
+          `(${(error as Error)?.message ?? String(error)}); check the database before continuing with a new runtime`,
+        { cause: commitError },
+      );
+      throw broken;
+    }
+
+    const { record } = durable;
+    const same = record !== undefined && record.work.sequence === work.sequence && sameWork(record.work, work);
+    if (same && record.status === "completed" && record.completedAt === work.at) {
+      ({ store, random } = durable);
+      return;
+    }
+    if (same && record.status === "pending") {
+      ({ store, random } = durable);
+      throw new CommitNotConfirmedError(
+        `${label} failed, and the item is still pending without a receipt, so it did not commit; ` +
+          "it was not executed again",
+        { cause: commitError },
+      );
+    }
+    const found =
+      record === undefined
+        ? "no work item with that ID"
+        : same
+          ? `a receipt completed at ${record.completedAt}, not ${work.at}`
+          : `${record.status} work with a different request or sequence`;
+    broken = new CommitOutcomeUnknownError(
+      `${label} failed without showing whether it committed, and the database holds ${found}; ` +
+        "check the database before continuing with a new runtime",
+      { cause: commitError },
+    );
+    throw broken;
   }
 
   const storage: SchedulerStorage = {
@@ -282,6 +373,7 @@ export async function loadPostgresOperationRuntime(client: PostgresQueryable): P
     readDue: guarded(false, base.readDue),
     countPending: guarded(false, base.countPending),
     readWorkIdStatus: guarded(false, base.readWorkIdStatus),
+    readWork: guarded(false, base.readWork),
     markCompleted: guarded(true, base.markCompleted),
     runWork,
   };
