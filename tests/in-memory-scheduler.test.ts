@@ -150,12 +150,37 @@ describe("scheduling", () => {
     expect(scheduler.pendingCount()).toBe(2);
   });
 
-  test("a completed ID may be scheduled again", () => {
+  test("rejects a completed ID without modifying the queue", () => {
     const scheduler = createInMemoryScheduler();
     scheduler.schedule(work("w1", 5));
     expect(runAll(scheduler, 5).ids).toEqual(["w1"]);
-    scheduler.schedule(work("w1", 6));
-    expect(runAll(scheduler, 6).ids).toEqual(["w1"]);
+    expect(() => scheduler.schedule(work("w1", 6))).toThrow("has already completed");
+    expect(scheduler.pendingCount()).toBe(0);
+    scheduler.schedule(work("W1", 6)); // case-distinct IDs remain available
+    expect(runAll(scheduler, 6).ids).toEqual(["W1"]);
+  });
+
+  test("a failed ID stays pending, is retried, and cannot be reused once it completes", () => {
+    const scheduler = createInMemoryScheduler();
+    scheduler.schedule(work("w1", 5));
+    expect(() =>
+      scheduler.advanceTo(simTime(5), 10, () => {
+        throw new Error("fail");
+      }),
+    ).toThrow("fail");
+    expect(() => scheduler.schedule(work("w1", 5))).toThrow("is already pending");
+    expect(runAll(scheduler, 5).ids).toEqual(["w1"]);
+    expect(() => scheduler.schedule(work("w1", 6))).toThrow("has already completed");
+  });
+
+  test("after a limited advance, only executed IDs count as completed", () => {
+    const scheduler = createInMemoryScheduler();
+    scheduler.schedule(work("w1", 5));
+    scheduler.schedule(work("w2", 5));
+    expect(runAll(scheduler, 5, 1).ids).toEqual(["w1"]);
+    expect(() => scheduler.schedule(work("w1", 5))).toThrow("has already completed");
+    expect(() => scheduler.schedule(work("w2", 5))).toThrow("is already pending");
+    expect(runAll(scheduler, 5).ids).toEqual(["w2"]);
   });
 
   test("rejected work consumes no ordering position", () => {

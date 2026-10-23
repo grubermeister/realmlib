@@ -223,9 +223,10 @@ result; // { now: 5000, executed: 1, reachedTarget: true }
   request envelope (module ID, nonblank operation name, positive safe-integer
   version) and stores a **copy**. The payload must be a `StateValue` (see
   [In-memory module state](#in-memory-module-state)). Validation is structural
-  only: the registry is not consulted. An ID may not be reused while it is
-  pending, but may be reused once that item has completed. Invalid input or a
-  duplicate throws and changes nothing.
+  only: the registry is not consulted. Work IDs are **unique for the
+  scheduler's lifetime**: an ID may not be reused while it is pending or after
+  it has completed (the scheduler remembers every completed ID). Invalid input
+  or a duplicate throws and changes nothing.
 - `advanceTo(target, maxOperations, execute)` runs items due **at or before**
   `target`, ordered by time and then by insertion order. Before each callback,
   `now()` is set to that item's time. Each callback receives a fresh copy of

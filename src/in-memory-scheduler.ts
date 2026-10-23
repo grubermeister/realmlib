@@ -44,7 +44,7 @@ export interface InMemoryScheduler {
    *
    * @throws {TypeError | RangeError} if the ID, time, or request is invalid.
    * @throws {RangeError} if `work.at` is earlier than `now()`.
-   * @throws {Error} if an item with the same ID is pending, or `advanceTo()` is running.
+   * @throws {Error} if an item with the same ID is pending or has completed, or `advanceTo()` is running.
    */
   schedule(work: ScheduledWork): void;
 
@@ -188,6 +188,8 @@ export function createInMemoryScheduler(initialTime: SimTime = toSimTime(0)): In
   let current = toSimTime(initialTime);
   const queue = new WorkQueue();
   const pendingIds = new Set<string>();
+  // Work IDs are unique for the scheduler's lifetime, so completed IDs are never forgotten.
+  const completedIds = new Set<string>();
   let nextSequence = 0;
   let dispatching = false;
 
@@ -215,6 +217,9 @@ export function createInMemoryScheduler(initialTime: SimTime = toSimTime(0)): In
     const request = validateRequest(rawRequest);
     if (pendingIds.has(id)) {
       throw new Error(`Work item ${JSON.stringify(id)} is already pending`);
+    }
+    if (completedIds.has(id)) {
+      throw new Error(`Work item ${JSON.stringify(id)} has already completed; work IDs cannot be reused`);
     }
     queue.push({ id, at, sequence: nextSequence++, request });
     pendingIds.add(id);
@@ -246,6 +251,7 @@ export function createInMemoryScheduler(initialTime: SimTime = toSimTime(0)): In
         // schedule() is blocked while dispatching, so `next` is still the head.
         queue.pop();
         pendingIds.delete(next.id);
+        completedIds.add(next.id);
         executed++;
       }
       current = to;
