@@ -28,5 +28,7 @@ export type {
   WorkIdStatus,
 } from "./scheduler.ts";
 export { createInMemoryScheduler, createInMemorySchedulerStorage } from "./in-memory-scheduler.ts";
+export { createPostgresSchedulerStorage, initializePostgresSchedulerStorage } from "./postgres-scheduler-storage.ts";
+export type { PostgresQueryable } from "./postgres-scheduler-storage.ts";
 export { createSeededRandom } from "./seeded-random.ts";
 export type { RandomSnapshot, RandomSource, SeededRandom } from "./seeded-random.ts";

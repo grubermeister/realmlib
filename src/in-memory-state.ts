@@ -8,7 +8,7 @@
  * private staging path (see {@link stagingFor}) supports atomic operations.
  */
 
-import { moduleId as toModuleId } from "./identifiers.ts";
+import { moduleId as toModuleId, textStorageProblem } from "./identifiers.ts";
 import type { ModuleId } from "./identifiers.ts";
 
 /** Ordinary JSON-compatible data. Numbers must be finite and not -0. */
@@ -65,6 +65,8 @@ function validateKey(key: unknown): string {
   if (key.trim() === "") {
     throw new RangeError("State key must not be empty or whitespace-only");
   }
+  const problem = textStorageProblem(key);
+  if (problem !== undefined) throw new RangeError(`State key ${problem}`);
   return key;
 }
 

@@ -1,14 +1,26 @@
 -- realmlib persistence schema, version 001: durable simulation state.
 --
--- Target: PostgreSQL 18. Plain DDL only, with no transaction control, so the
--- applier chooses the transaction (for example `psql --single-transaction`).
--- Nothing applies this file automatically, and it inserts no rows.
+-- Target: PostgreSQL 18, in a UTF8 database. Plain DDL plus one encoding guard,
+-- with no transaction control, so the applier chooses the transaction (for
+-- example `psql --single-transaction`). Nothing applies this file
+-- automatically, and it inserts no rows.
 --
 -- The schema range-checks values but cannot prove they are valid realmlib
 -- values: JavaScript validation (including rejection of -0, which integer casts
 -- and JSON.stringify() erase) must run before writing and after reading. JSON,
 -- not JSONB, keeps the serialized text unchanged, including \u0000 escapes and
 -- object key order. 9007199254740991 is Number.MAX_SAFE_INTEGER.
+
+-- realmlib's JavaScript text validation (no U+0000, no unpaired surrogates)
+-- matches exactly what a UTF8 database accepts. Other encodings reject or
+-- alter other characters, and a database's encoding cannot change after it is
+-- created, so refuse to create anything here.
+DO $$
+BEGIN
+  IF current_setting('server_encoding') <> 'UTF8' THEN
+    RAISE EXCEPTION 'realmlib requires a UTF8 database, but server_encoding is %', current_setting('server_encoding');
+  END IF;
+END $$;
 
 CREATE SCHEMA realmlib;
 

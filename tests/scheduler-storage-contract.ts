@@ -9,7 +9,7 @@
 
 import { describe, expect, test } from "bun:test";
 import { createScheduler, moduleId, simTime, workItemId } from "../src/index.ts";
-import type { ScheduledWork, SchedulerStorage, SimTime, StoredWork, WorkItemId } from "../src/index.ts";
+import type { ModuleId, ScheduledWork, SchedulerStorage, SimTime, StoredWork, WorkItemId } from "../src/index.ts";
 
 export type SchedulerStorageFactory = (initialTime: SimTime) => SchedulerStorage | Promise<SchedulerStorage>;
 
@@ -116,6 +116,16 @@ export function describeSchedulerStorageContract(name: string, create: Scheduler
       await expect(storage.readDue(simTime(0), loose<number>("1"))).rejects.toThrow(TypeError);
     });
 
+    test("a -0 sequence is rejected even when the next sequence is 0, and changes nothing", async () => {
+      const storage = await fresh();
+      await expect(storage.insertPending(stored("w1", 10, -0), 1)).rejects.toThrow(RangeError);
+      await expect(storage.insertPending(stored("w1", 10, 0), -0)).rejects.toThrow(RangeError);
+      expect(await storage.readNextSequence()).toBe(0);
+      expect(await storage.readWorkIdStatus(workItemId("w1"))).toBeUndefined();
+      await storage.insertPending(stored("w1", 10, 0), 1);
+      expect(Object.is((await storage.readDue(simTime(10), 1))[0]!.sequence, 0)).toBe(true);
+    });
+
     test("completion removes pending work, keeps its ID occupied, and leaves the sequence alone", async () => {
       const storage = await fresh();
       for (const [index, id] of ["w1", "w2", "w3"].entries()) await storage.insertPending(stored(id, 10, index), index + 1);
@@ -152,6 +162,7 @@ export function describeSchedulerStorageContract(name: string, create: Scheduler
       await expect(storage.insertPending(stored("done", 20, 2), 3)).rejects.toThrow(Error);
       await expect(storage.insertPending(stored("w3", 20, 1), 3)).rejects.toThrow(RangeError);
       await expect(storage.insertPending(stored("w3", 20, 2), 2)).rejects.toThrow(RangeError);
+      await expect(storage.insertPending(stored("w3", 20, 2), 2.5)).rejects.toThrow(RangeError);
 
       expect(await storage.readNextSequence()).toBe(2);
       expect(await dueIds(storage)).toEqual(["pending"]);
@@ -276,6 +287,25 @@ export function describeSchedulerStorageContract(name: string, create: Scheduler
       expect(await storage.readNextSequence()).toBe(1);
       expect(await dueIds(storage)).toEqual(["w1"]);
       expect(await storage.readWorkIdStatus(loose<WorkItemId>("w2"))).toBeUndefined();
+    });
+
+    test("IDs and operation names with U+0000 or unpaired surrogates are rejected without changing storage", async () => {
+      const storage = await fresh();
+      const scheduler = createScheduler(storage);
+      for (const text of ["w\u0000", "w\ud800", "\udc00w"]) {
+        await expect(scheduler.schedule(loose<ScheduledWork>({ ...work("w1", 0), id: text }))).rejects.toThrow(RangeError);
+        const bad = { ...work("w1", 0), request: { ...request(), operation: text } };
+        await expect(scheduler.schedule(bad)).rejects.toThrow(RangeError);
+        const badModule = { ...work("w1", 0), request: { ...request(), moduleId: loose<ModuleId>(text) } };
+        await expect(scheduler.schedule(badModule)).rejects.toThrow(RangeError);
+      }
+      expect(await storage.readNextSequence()).toBe(0);
+      expect(await storage.countPending()).toBe(0);
+
+      // A well-formed surrogate pair is ordinary text and round-trips.
+      const emoji = { id: workItemId("w\ud83d\ude00"), at: simTime(0), request: { ...request(), operation: "op\ud83d\ude00" } };
+      await scheduler.schedule(emoji);
+      expect(await storage.readDue(simTime(0), 1)).toEqual([{ ...emoji, sequence: 0 }]);
     });
   });
 }

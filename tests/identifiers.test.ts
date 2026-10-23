@@ -32,6 +32,13 @@ describe.each(factories)("%s", (_name, factory) => {
     }
   });
 
+  test("rejects U+0000 and unpaired surrogates with RangeError, but accepts surrogate pairs", () => {
+    for (const value of ["\u0000", "a\u0000b", "\ud800", "a\udc00", "\ude00\ud83d"]) {
+      expect(() => factory(value)).toThrow(RangeError);
+    }
+    expect<string>(factory("a\ud83d\ude00b")).toBe("a\ud83d\ude00b");
+  });
+
   test("rejects non-string runtime values with TypeError", () => {
     const invalid: unknown[] = [undefined, null, 0, 1n, true, Symbol("s"), {}, [], new String("s")];
     for (const value of invalid) {

@@ -6,7 +6,7 @@
 
 import type { WorkItemId } from "./identifiers.ts";
 import { copyState } from "./in-memory-state.ts";
-import { createScheduler, validatePositiveCount } from "./scheduler.ts";
+import { createScheduler, validatePositiveCount, validateSequence } from "./scheduler.ts";
 import type { Scheduler, SchedulerStorage, StoredWork, WorkIdStatus } from "./scheduler.ts";
 import { simTime as toSimTime } from "./sim-time.ts";
 import type { SimTime } from "./sim-time.ts";
@@ -142,10 +142,11 @@ export function createInMemorySchedulerStorage(initialTime: SimTime = toSimTime(
       if (status(stored.id) !== undefined) {
         throw new Error(`Work item ${JSON.stringify(stored.id)} is already ${status(stored.id)}`);
       }
-      if (!Number.isSafeInteger(stored.sequence) || stored.sequence < nextSequence) {
+      // validateSequence() also rejects -0, which `<` would let through at sequence 0.
+      if (validateSequence(stored.sequence, "Work sequence") < nextSequence) {
         throw new RangeError(`Work sequence ${stored.sequence} is below the next sequence ${nextSequence}`);
       }
-      if (!Number.isSafeInteger(next) || next <= stored.sequence) {
+      if (validateSequence(next, "Next sequence") <= stored.sequence) {
         throw new RangeError(`Next sequence ${next} must be a safe integer above ${stored.sequence}`);
       }
       queue.push(stored);

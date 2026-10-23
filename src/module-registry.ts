@@ -6,7 +6,7 @@
  * It does not execute operations, mutate state, or create work items.
  */
 
-import { moduleId as toModuleId } from "./identifiers.ts";
+import { moduleId as toModuleId, textStorageProblem } from "./identifiers.ts";
 import type { ModuleId } from "./identifiers.ts";
 
 /** One operation type accepted by a module, at exactly one payload version. */
@@ -68,8 +68,8 @@ interface RegisteredOperation {
   readonly validatePayload: (payload: unknown) => boolean;
 }
 
-function isNonBlankString(value: unknown): value is string {
-  return typeof value === "string" && value.trim() !== "";
+function isOperationName(value: unknown): value is string {
+  return typeof value === "string" && value.trim() !== "" && textStorageProblem(value) === undefined;
 }
 
 function isPositiveSafeInteger(value: unknown): value is number {
@@ -111,8 +111,10 @@ export function createModuleRegistry(): ModuleRegistry {
         throw new TypeError(`${where}: definition must be an object`);
       }
       const { name, version, validatePayload } = operation;
-      if (!isNonBlankString(name)) {
-        throw new TypeError(`${where}: name must be a nonempty, non-whitespace-only string`);
+      if (!isOperationName(name)) {
+        throw new TypeError(
+          `${where}: name must be a nonempty, non-whitespace-only string without U+0000 or unpaired surrogates`,
+        );
       }
       if (!isPositiveSafeInteger(version)) {
         throw new RangeError(`${where} (${JSON.stringify(name)}): version must be a positive safe integer`);
@@ -143,7 +145,7 @@ export function createModuleRegistry(): ModuleRegistry {
     } catch {
       return fail("malformed-request");
     }
-    if (!isNonBlankString(operation) || !isPositiveSafeInteger(payloadVersion)) {
+    if (!isOperationName(operation) || !isPositiveSafeInteger(payloadVersion)) {
       return fail("malformed-request");
     }
 

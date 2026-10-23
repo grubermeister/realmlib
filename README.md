@@ -7,8 +7,8 @@ Bun programs without depending on either.
 It currently provides foundational value types (identifiers and simulation
 time), a registry for validating operation requests, an in-memory
 module state store, atomic execution of a single operation against that
-store, a manually advanced scheduler over replaceable storage (with an
-in-memory implementation), and seeded random streams
+store, a manually advanced scheduler over replaceable storage (with in-memory
+and PostgreSQL implementations), and seeded random streams
 whose draws commit with an operation; it contains **no simulation
 engine or behavior**.
 
@@ -42,6 +42,12 @@ const at: SimTime = simTime(90_000); // 90 simulated seconds after the origin
   Identifiers are **caller-supplied**: the factories only validate (any nonempty,
   non-whitespace-only string) and return the value unchanged. They do not
   generate IDs, check uniqueness, or register anything.
+- **Storable text:** identifiers, operation names, and state keys must not
+  contain U+0000 or an unpaired UTF-16 surrogate (`RangeError`, or
+  `malformed-request` from `validate()`). PostgreSQL rejects U+0000, and an
+  unpaired surrogate has no UTF-8 encoding, so it would be stored altered.
+  Surrogate pairs (such as emoji) are fine. String *values* inside payloads and
+  state are unrestricted, because JSON escapes them.
 - `SimTime` is a branded integer number of **simulated milliseconds since an
   arbitrary simulation origin** (`0` through `Number.MAX_SAFE_INTEGER`). It is
   **not** wall-clock time or a Unix timestamp, and there is no clock.
@@ -128,7 +134,7 @@ a.delete("counter"); // true
   persistence, multi-record atomicity, or rollback (for atomic multi-record
   changes, see [Executing an operation](#executing-an-operation)). The store
   does not use the module registry.
-- Keys are nonblank, case-sensitive strings. Values must be `null`, booleans,
+- Keys are nonblank, case-sensitive [storable](#identifiers-and-simulation-time) strings. Values must be `null`, booleans,
   strings, finite numbers other than `-0`, dense arrays, or plain objects of these. Anything
   else (`undefined`, `NaN`, class instances, `Date`, cycles, accessors, …)
   throws `TypeError` and leaves the existing record unchanged.
@@ -227,7 +233,7 @@ result; // { now: 5000, executed: 1, reachedTarget: true }
   `now()`, `pendingCount()`, `schedule()`, and `advanceTo()`. The `execute`
   callback itself must still be synchronous.
 - `schedule(work)` validates the work ID, time (not earlier than `now()`), and
-  request envelope (module ID, nonblank operation name, positive safe-integer
+  request envelope (module ID, nonblank storable operation name, positive safe-integer
   version) and stores a **copy**, taken when `schedule()` is called. The payload
   must be a `StateValue` (see [In-memory module state](#in-memory-module-state)).
   Validation is structural only: the registry is not consulted. Work IDs are
@@ -285,7 +291,8 @@ The scheduler owns ordering, validation, and advancement policy. A
 - Every method returns a Promise. The scheduler validates values before writing
   them; storage must return validated values, and returned objects belong to
   the caller. Storage rejects inserting an occupied ID or a sequence that does
-  not increase, and completing an ID that is not pending.
+  not increase or is not a nonnegative safe integer (including `-0`), and
+  completing an ID that is not pending.
 - **Ordering key:** `(at, sequence)`. `schedule()` assigns the stored next
   sequence and stores the next one, so sequences are never reused, even after
   the queue empties. Rejected work consumes none.
@@ -301,7 +308,8 @@ The scheduler owns ordering, validation, and advancement policy. A
   persisted.
 - The fields correspond to `realmlib.runtime_state` (`now_ms`, `next_sequence`)
   and `realmlib.work_items` (`status` `'pending'` or `'completed'`; a completed
-  item's time is the clock when it completed). No PostgreSQL storage exists yet.
+  item's time is the clock when it completed). See
+  [PostgreSQL scheduler storage](#postgresql-scheduler-storage).
 
 ## Seeded randomness
 
@@ -354,7 +362,8 @@ const copy = createSeededRandom(JSON.parse(JSON.stringify(saved))); // continues
 [`migrations/001_initial_persistence.sql`](migrations/001_initial_persistence.sql)
 defines durable storage for one simulation in a dedicated `realmlib` schema,
 targeting **PostgreSQL 18**. It is a plain SQL asset: nothing in the library
-imports it, connects to a database, or uses its tables yet.
+imports or applies it. [PostgreSQL scheduler storage](#postgresql-scheduler-storage)
+uses its `runtime_state` and `work_items` tables.
 
 | Table                    | Holds                                                                 |
 |--------------------------|-----------------------------------------------------------------------|
@@ -366,6 +375,10 @@ imports it, connects to a database, or uses its tables yet.
   migration-history table) and creating the `runtime_state` row are left to
   the application. The file has no transaction control, so apply it in one
   transaction, for example `psql --single-transaction --file migrations/001_initial_persistence.sql`.
+- **UTF8 only:** the migration raises an error, creating nothing, unless the
+  database's `server_encoding` is `UTF8` (the encoding realmlib's text
+  validation matches). Create the database with `ENCODING 'UTF8'` if your
+  cluster's default differs.
 - Values are stored as `JSON` (not `JSONB`) so serialized text is kept
   unchanged. Times, sequences, and payload versions are `BIGINT` limited to the
   JavaScript safe-integer range. These checks are a backstop: values must still
@@ -380,3 +393,76 @@ needs `psql` and is skipped unless the variable is set:
 ```sh
 REALMLIB_TEST_DATABASE_URL=postgresql://user@host/realmlib_scratch bun test tests/postgres-schema.test.ts
 ```
+
+## PostgreSQL scheduler storage
+
+`createPostgresSchedulerStorage(client)` is a `SchedulerStorage` over the
+migrated schema. Use it with `createScheduler()` exactly like in-memory storage.
+
+```ts
+import pg from "pg";
+import { createPostgresSchedulerStorage, createScheduler, initializePostgresSchedulerStorage, simTime } from "realmlib";
+
+const pool = new pg.Pool({ connectionString: process.env.DATABASE_URL }); // yours to create and end
+await initializePostgresSchedulerStorage(pool, simTime(0)); // once, for a new simulation
+const scheduler = createScheduler(createPostgresSchedulerStorage(pool));
+// ... schedule() and advanceTo() as usual ...
+await pool.end();
+```
+
+- **The caller owns the connection.** `client` is anything with
+  `query(text, values) => Promise<{ rows }>`, such as a `pg` `Client`, `Pool`, or
+  `PoolClient`. realmlib does not depend on or import `pg`, and creating storage
+  runs no queries. Nothing opens or closes connections, reads the environment,
+  applies the migration, or advances time for you.
+- **Initialization is explicit.** `initializePostgresSchedulerStorage(client,
+  initialTime?)` inserts the `runtime_state` row (clock `initialTime`, default
+  `simTime(0)`; next sequence `0`; no random snapshot; format version `1`). It
+  first requires `server_encoding` and the connection's `client_encoding` to be
+  `UTF8`, and it rejects if the row already exists or `work_items` has rows, so
+  it never overwrites. Storage methods reject when the row is missing; they never
+  recreate it.
+- **Columns used:** `runtime_state.now_ms`, `next_sequence`, and
+  `format_version` (only `1` is accepted), plus every column of `work_items`.
+  `markCompleted()` sets `status = 'completed'` and `completed_at_ms` to the
+  **stored simulation clock**, never wall time, and keeps the row as the
+  receipt, so its ID and sequence are never reused. `random_snapshot` and
+  `state_records` are not used.
+- `readDue()` is ordered by `(at_ms, sequence)` and limited in SQL.
+  `insertPending()` inserts the row and advances `next_sequence` in **one
+  statement**, so a duplicate ID, stale sequence, or failed insert consumes no
+  sequence.
+- **Validation:** inputs are validated before they are serialized (so `-0`,
+  non-finite numbers, JavaScript-only whitespace such as U+00A0, U+0000, and
+  unpaired surrogates are rejected; the schema's `btrim()` checks would accept
+  the whitespace, and `pg` would silently replace an unpaired surrogate with
+  U+FFFD). This matches exactly what a UTF8 database accepts, which is why
+  initialization requires UTF8. A database's server encoding cannot change
+  after creation, but each connection must also stay at the default UTF8
+  `client_encoding`; do not override it with `client_encoding` or
+  `PGCLIENTENCODING`. Values read
+  back are validated too: BIGINT columns are read as text and must be decimal
+  integers in their field's safe range, and JSON is read as text and must be a
+  valid `StateValue`. Invalid persisted data rejects with `TypeError`. Database
+  errors propagate; only a work-ID key violation is rethrown as a duplicate-ID
+  `Error` whose `cause` is the original.
+- **Not atomic across an operation.** Each method is one statement, atomic by
+  itself. Nothing commits an operation's state changes, random draws, queue
+  change, and clock together, so a crash between them can, for example, leave
+  an item pending after its effects were applied elsewhere. Safe retries are
+  not provided.
+- **One driver per database.** Use one scheduler against a given database at a
+  time. This is a precondition; it is not enforced, and concurrent drivers are
+  not arbitrated.
+
+Its tests run the shared storage contract plus PostgreSQL boundary cases. They
+are opt-in under the same variable as the schema test: they apply the migration
+to the named **disposable** database, refuse to run if a `realmlib` schema
+already exists, and drop the schema afterwards. Without the variable they are
+reported as skipped, not passed.
+
+```sh
+REALMLIB_TEST_DATABASE_URL=postgresql://user@host/realmlib_scratch bun test
+```
+
+`pg` and `@types/pg` are development dependencies, used only by these tests.

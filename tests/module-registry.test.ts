@@ -90,9 +90,9 @@ describe("register", () => {
     }
   });
 
-  test("rejects blank or non-string operation names", () => {
+  test("rejects blank, non-string, or unstorable operation names", () => {
     const registry = createModuleRegistry();
-    for (const name of ["", " ", "\t\n", undefined, null, 1, {}]) {
+    for (const name of ["", " ", "\t\n", "op\u0000", "op\ud800", undefined, null, 1, {}]) {
       expect(() => registry.register({ id: moduleId("mod-a"), operations: [op(name as string)] })).toThrow(
         /name must be/,
       );
@@ -227,7 +227,7 @@ describe("validate", () => {
     const registry = registryWith({ id: moduleId("mod-a"), operations: [op("op-x")] });
     const invalid: Partial<Record<keyof OperationRequest, unknown>>[] = [
       ...["", "  ", undefined, null, 1, {}, new String("mod-a")].map((moduleId) => ({ moduleId })),
-      ...["", " \t", undefined, null, 1, {}].map((operation) => ({ operation })),
+      ...["", " \t", "op-x\u0000", "\udc00", undefined, null, 1, {}].map((operation) => ({ operation })),
       ...[0, -0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY, Number.MAX_SAFE_INTEGER + 1, "1", null, 1n].map(
         (payloadVersion) => ({ payloadVersion }),
       ),

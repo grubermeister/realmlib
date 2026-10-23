@@ -8,7 +8,7 @@
  * There is no handler registry, dispatch, transaction layer, or cancellation here.
  */
 
-import { moduleId as toModuleId, workItemId as toWorkItemId } from "./identifiers.ts";
+import { moduleId as toModuleId, textStorageProblem, workItemId as toWorkItemId } from "./identifiers.ts";
 import type { WorkItemId } from "./identifiers.ts";
 import { copyState } from "./in-memory-state.ts";
 import type { StateValue } from "./in-memory-state.ts";
@@ -139,7 +139,24 @@ function isThenable(value: unknown): boolean {
   );
 }
 
-function validateRequest(input: unknown): StoredWork["request"] {
+/**
+ * @internal Validates an operation name: a nonempty, non-whitespace-only string
+ * without U+0000 or unpaired surrogates. `name` labels it in error messages.
+ */
+export function validateOperationName(value: unknown, name: string): string {
+  if (typeof value !== "string") {
+    throw new TypeError(`${name} must be a string, received ${typeof value}`);
+  }
+  if (value.trim() === "") {
+    throw new RangeError(`${name} must not be empty or whitespace-only`);
+  }
+  const problem = textStorageProblem(value);
+  if (problem !== undefined) throw new RangeError(`${name} ${problem}`);
+  return value;
+}
+
+/** @internal Validates and copies a request envelope whose payload must be a {@link StateValue}. */
+export function validateRequest(input: unknown): StoredWork["request"] {
   if (!isObject(input) || Array.isArray(input)) {
     throw new TypeError("Scheduled request must be an object");
   }
@@ -151,12 +168,7 @@ function validateRequest(input: unknown): StoredWork["request"] {
   // Read each field once so accessors cannot yield different values between checks.
   const { moduleId, operation, payloadVersion, payload } = input;
   const id = toModuleId(moduleId as string);
-  if (typeof operation !== "string") {
-    throw new TypeError(`Scheduled request operation must be a string, received ${typeof operation}`);
-  }
-  if (operation.trim() === "") {
-    throw new RangeError("Scheduled request operation must not be empty or whitespace-only");
-  }
+  validateOperationName(operation, "Scheduled request operation");
   if (typeof payloadVersion !== "number") {
     throw new TypeError(`Scheduled request payloadVersion must be a number, received ${typeof payloadVersion}`);
   }
@@ -165,7 +177,18 @@ function validateRequest(input: unknown): StoredWork["request"] {
       `Scheduled request payloadVersion must be a positive safe integer, received ${Object.is(payloadVersion, -0) ? "-0" : payloadVersion}`,
     );
   }
-  return { moduleId: id, operation, payloadVersion, payload: copyState(payload, "payload") };
+  return { moduleId: id, operation: operation as string, payloadVersion, payload: copyState(payload, "payload") };
+}
+
+/** @internal Validates a work sequence number: a nonnegative safe integer other than -0. */
+export function validateSequence(value: unknown, name: string): number {
+  if (typeof value !== "number") {
+    throw new TypeError(`${name} must be a number, received ${typeof value}`);
+  }
+  if (!Number.isSafeInteger(value) || value < 0 || Object.is(value, -0)) {
+    throw new RangeError(`${name} must be a nonnegative safe integer, received ${Object.is(value, -0) ? "-0" : value}`);
+  }
+  return value;
 }
 
 /** @internal Validates a positive safe integer such as `maxOperations`. */

@@ -58,6 +58,16 @@ describe("identifiers and keys", () => {
     }
   });
 
+  test("rejects keys containing U+0000 or unpaired surrogates with RangeError", () => {
+    for (const key of ["\u0000", "k\u0000", "\ud800", "k\udfff"]) {
+      expect(() => access.set(key, 1)).toThrow(RangeError);
+      expect(() => access.get(a, key)).toThrow(RangeError);
+      expect(() => access.delete(key)).toThrow(RangeError);
+    }
+    access.set("k\ud83d\ude00", 1);
+    expect(access.get(a, "k\ud83d\ude00")).toBe(1);
+  });
+
   test("rejects non-string keys with TypeError", () => {
     for (const key of [undefined, null, 0, 1n, true, Symbol("s"), {}, [], new String("k")]) {
       expect(() => access.set(key as string, 1)).toThrow(TypeError);
