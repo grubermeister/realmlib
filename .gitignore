@@ -1,0 +1,15 @@
+# Dependencies
+node_modules/
+
+# Local environment
+.env
+.env.*
+
+# Temporary files
+*.tmp
+*.log
+.DS_Store
+
+# Generated output
+dist/
+*.tsbuildinfo
