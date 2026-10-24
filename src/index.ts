@@ -32,7 +32,13 @@ export type {
 export { createInMemoryScheduler, createInMemorySchedulerStorage } from "./in-memory-scheduler.ts";
 export { createPostgresSchedulerStorage, initializePostgresSchedulerStorage } from "./postgres-scheduler-storage.ts";
 export type { PostgresQueryable } from "./postgres-scheduler-storage.ts";
-export { CommitNotConfirmedError, CommitOutcomeUnknownError, loadPostgresOperationRuntime } from "./postgres-operation-runtime.ts";
-export type { PostgresOperationRuntime } from "./postgres-operation-runtime.ts";
+export {
+  CommitNotConfirmedError,
+  CommitOutcomeUnknownError,
+  loadPostgresOperationRuntime,
+  NotOwnerError,
+  POSTGRES_DRIVER_LOCK_KEY,
+} from "./postgres-operation-runtime.ts";
+export type { DriverOwnership, PostgresOperationRuntime } from "./postgres-operation-runtime.ts";
 export { createSeededRandom } from "./seeded-random.ts";
 export type { RandomSnapshot, RandomSource, SeededRandom } from "./seeded-random.ts";

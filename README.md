@@ -10,7 +10,8 @@ module state store, atomic execution of a single operation against that
 store, a manually advanced scheduler over replaceable storage (with in-memory
 and PostgreSQL implementations), seeded random streams
 whose draws commit with an operation, and a PostgreSQL path that commits each
-scheduled operation's effects in one transaction; it contains **no simulation
+scheduled operation's effects in one transaction, advanced only by the one
+driver holding the database's ownership lock; it contains **no simulation
 engine or behavior**.
 
 The target runtime is Bun. Compatibility with Node.js or browsers is not established.
@@ -501,8 +502,8 @@ await pool.end();
   `schedule()` is safe (see [Resubmitting work](#resubmitting-work)); nothing
   is retried automatically.
 - **One driver per database.** Use one scheduler against a given database at a
-  time. This is a precondition; it is not enforced, and concurrent drivers are
-  not arbitrated.
+  time. This storage by itself does not enforce that; the
+  [operation runtime](#driver-ownership) does, with an advisory lock.
 
 Its tests run the shared storage contract plus PostgreSQL boundary cases. They
 are opt-in under the same variable as the schema test: they apply the migration
@@ -532,12 +533,14 @@ await client.connect();
 await initializePostgresSchedulerStorage(client, simTime(0), createSeededRandom(12345).snapshot());
 
 const runtime = await loadPostgresOperationRuntime(client);
+if (!(await runtime.tryAcquireOwnership())) throw new Error("another driver owns this simulation");
 // registry and transfer as in "Executing an operation" above; schedule() as usual.
 await runtime.scheduler.advanceTo(simTime(5_000), 100, (work) => {
   const outcome = runtime.execute(registry, work.request, transfer);
   if (!outcome.ok) throw new Error(`rejected: ${outcome.reason}`);
 });
 runtime.read(moduleId("module-a"), "from"); // committed value
+await runtime.releaseOwnership(); // if this rejects, end the connection; never reuse it
 await client.end();
 ```
 
@@ -584,14 +587,16 @@ await client.end();
   and payload, as in [Resubmitting work](#resubmitting-work)):
   - **Completed**, matching, with `completed_at_ms` at the item's time: the
     item committed. The in-memory state and random stream are replaced by the
-    values just read, and `advanceTo()` continues with the next item. The
-    handler is not run again.
+    values just read. The handler is not run again. Because the failure has
+    already cost the runtime its [ownership](#driver-ownership), `advanceTo()`
+    then rejects with `NotOwnerError` instead of continuing.
   - **Pending**, matching: it did not commit. The in-memory views are replaced
     by the values read (unchanged, since nothing committed), and `advanceTo()`
     rejects with `CommitNotConfirmedError`, whose `cause` is the `COMMIT`
     error. The item stays pending with the clock where it was before the item
-    (as for any database failure); it is **not** run again until you call
-    `advanceTo()` again. The runtime stays usable.
+    (as for any database failure); it is **not** run again automatically. The
+    runtime stays readable but has lost ownership: a new owner on a new
+    connection runs the item.
   - **Anything else** (the `ROLLBACK` or the read fails, for example because
     the connection is gone; the row is missing, unreadable, or holds a
     different request or completion time): `CommitOutcomeUnknownError`, and
@@ -609,8 +614,76 @@ await client.end();
   clock and receipt.
 - **Not covered:** external side effects of handlers (the database guarantee
   covers only the simulation's database effects, not exactly-once delivery),
-  automatic retries, crash recovery, and concurrent drivers. Use one runtime
-  per database at a time.
+  automatic retries, and crash recovery. Concurrent drivers are excluded by
+  [driver ownership](#driver-ownership).
+
+### Driver ownership
+
+Only one runtime at a time may advance a database's simulation. Ownership is a
+PostgreSQL **session-level advisory lock** on the runtime's own connection, so
+PostgreSQL, not a process-local flag, decides who owns.
+
+- **Key and scope:** `POSTGRES_DRIVER_LOCK_KEY` (`8243101811291744610`, the
+  ASCII bytes of `"realmlib"` as a 64-bit integer). PostgreSQL scopes advisory
+  locks to the current database, and the `realmlib` schema holds one
+  simulation, so the key covers exactly that simulation. In `pg_locks` it is
+  locktype `advisory`, classid `1919246700`, objid `1835821410`, objsubid `1`.
+  Do not take this key for anything else in the same database.
+- **Explicit lifecycle:** loading a runtime never acquires.
+  `runtime.tryAcquireOwnership()` calls `pg_try_advisory_lock` once; it never
+  waits or retries. It resolves `true` once the lock is held and the committed
+  state and random stream have been **reloaded** (so a runtime loaded before a
+  previous owner's commits continues from the database, not from what it saw),
+  or `false` on contention, changing nothing. It rejects, never resolving
+  `false`, on a database or connection error. It also rejects if the runtime
+  already owns, an acquire or release is in progress, or the connection's
+  session already holds the lock, for example through another runtime on the
+  same connection: advisory locks are reentrant, so a session is never locked
+  twice. `runtime.ownership()` reports `"owned"`, `"unowned"`, or `"lost"`.
+- **What is gated:** `runtime.scheduler.advanceTo()` rejects with
+  `NotOwnerError` (its `ownership` is `"unowned"` or `"lost"`) before reading
+  anything or calling its callback, and so do `runtime.storage.runWork()`,
+  `writeClock()`, and `markCompleted()`. Each item's transaction, and each of
+  those writes, first confirms **on the connection** that the session which
+  took the lock still holds it; if not (for example the lock was released by
+  raw SQL), nothing is run or committed and ownership is `"lost"`.
+  `schedule()`, `read()`, `randomSnapshot()`, `now()`, `pendingCount()`, and
+  other reads need no ownership, and producers using
+  `createPostgresSchedulerStorage()` on their own connections are unaffected.
+- **Same physical session:** the lock and every transaction of the runtime use
+  the one dedicated connection it was given, and the lock stays held across
+  any number of `advanceTo()` calls, commits, and rollbacks. This is why a
+  `Pool` is refused: never let a pool hand out the lock-holding connection.
+- **Release:** `runtime.releaseOwnership()` calls `pg_advisory_unlock` on that
+  session, refusing advancement from the moment it is called. It is rejected,
+  keeping the lock, while `advanceTo()` or a driver write is running; call it
+  when idle. It resolves at once if the runtime does not own. After a release,
+  another runtime may acquire and continue from the persisted clock, queue,
+  sequence, random stream, and receipts; completed IDs stay reserved and
+  completed handlers do not run again. A released runtime may acquire again.
+- **Loss fails closed:** ownership becomes `"lost"`, permanently for that
+  runtime, when its connection emits `"end"` (`pg` clients do; the runtime
+  listens only while it owns), when any statement fails without the server
+  reporting an error (or with SQLSTATE class 08, 53, 57, 58, or XX), when an ownership check or unlock fails, when the runtime becomes
+  unusable, or when an acquire attempt itself fails. A lost runtime never
+  advances or writes as driver again; an in-flight transaction on a lost
+  session is never treated as committed (an unknown `COMMIT` outcome is
+  settled from the receipt only to learn what committed, as above). Errors the
+  server reports on a healthy session, such as a rejected `COMMIT`, keep
+  ownership.
+- **Caller cleanup:** connection creation and disposal stay yours. Before
+  ending or releasing a connection back to its owner, call
+  `releaseOwnership()`. If it rejects, or ownership is `"lost"`, the session
+  may still hold the lock: **end** the connection (for a `PoolClient`,
+  `release(true)` to destroy it), never return it to a pool. PostgreSQL drops
+  a session's lock when its backend exits; another driver can acquire after
+  that. There is no waiting, heartbeat, takeover, or reconnection; a
+  JavaScript handler that is already running is not interrupted, and
+  external side effects of handlers are not covered.
+
+The ownership tests use separate physical connections to the disposable test
+database, including terminating an owner's backend; they run under the same
+opt-in variable and are reported as skipped without it.
 
 **API additions:** `loadPostgresOperationRuntime`, `PostgresOperationRuntime`,
 `CommitOutcomeUnknownError`; an optional `runWork()` on `SchedulerStorage`; an
@@ -620,3 +693,11 @@ Existing signatures and in-memory behavior are unchanged.
 **Later additions:** `CommitNotConfirmedError`; `CommitOutcomeUnknownError` is
 now thrown only when the durable record does not settle the outcome. See also
 the `schedule()` changes under [Resubmitting work](#resubmitting-work).
+
+**Ownership additions:** `tryAcquireOwnership()`, `releaseOwnership()`, and
+`ownership()` on `PostgresOperationRuntime`; `NotOwnerError`,
+`DriverOwnership`, and `POSTGRES_DRIVER_LOCK_KEY`. **Breaking:** a runtime's
+`advanceTo()`, `runWork()`, `writeClock()`, and `markCompleted()` now require
+ownership, and a confirmed commit after an unknown `COMMIT` outcome no longer
+lets the same runtime continue. Other signatures and in-memory behavior are
+unchanged.

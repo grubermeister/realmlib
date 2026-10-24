@@ -570,6 +570,8 @@ test("internal staging helpers are not exported from the package root", async ()
   expect(exported).toEqual([
     "CommitNotConfirmedError",
     "CommitOutcomeUnknownError",
+    "NotOwnerError",
+    "POSTGRES_DRIVER_LOCK_KEY",
     "WorkIdConflictError",
     "createInMemoryScheduler",
     "createInMemorySchedulerStorage",

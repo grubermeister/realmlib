@@ -1,4 +1,4 @@
-import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import { afterAll, afterEach, beforeAll, describe, expect, test } from "bun:test";
 import { realpath } from "node:fs/promises";
 import { join } from "node:path";
 import pg from "pg";
@@ -15,6 +15,8 @@ import {
   initializePostgresSchedulerStorage,
   loadPostgresOperationRuntime,
   moduleId,
+  NotOwnerError,
+  POSTGRES_DRIVER_LOCK_KEY,
   simTime,
   workItemId,
 } from "../src/index.ts";
@@ -141,6 +143,52 @@ describe("PostgreSQL operation runtime without a database", () => {
     ]);
   });
 
+  test("a runtime is unowned until it acquires, and refuses to advance or write before sending anything", async () => {
+    const client = stubClient();
+    const runtime = await loadPostgresOperationRuntime(client);
+    client.calls.length = 0;
+    expect(runtime.ownership()).toBe("unowned");
+    let called = false;
+    const failure = await runtime.scheduler.advanceTo(simTime(10), 1, () => void (called = true)).catch((e: unknown) => e);
+    expect(failure).toBeInstanceOf(NotOwnerError);
+    expect(failure).toMatchObject({ ownership: "unowned" });
+    await expect(runtime.storage.writeClock(simTime(5))).rejects.toBeInstanceOf(NotOwnerError);
+    await expect(runtime.storage.markCompleted(workItemId("w"))).rejects.toBeInstanceOf(NotOwnerError);
+    await expect(runtime.storage.runWork!(loose<StoredWork>({}), () => void (called = true))).rejects.toBeInstanceOf(
+      NotOwnerError,
+    );
+    // Releasing what is not held does nothing.
+    await runtime.releaseOwnership();
+    expect(called).toBe(false);
+    expect(client.calls).toEqual([]);
+  });
+
+  test("contention resolves false and changes nothing; a failed attempt rejects and loses ownership", async () => {
+    let lockResult: (() => Promise<{ rows: unknown[] }>) | undefined;
+    const client = stubClient();
+    const answering: PostgresQueryable = {
+      async query(text, values) {
+        if (text.includes("pg_try_advisory_lock")) return lockResult!();
+        return client.query(text, values);
+      },
+    };
+    const contender = await loadPostgresOperationRuntime(answering);
+    lockResult = async () => ({ rows: [{ pid: 7, held: false, acquired: false }] });
+    expect(await contender.tryAcquireOwnership()).toBe(false);
+    expect(contender.ownership()).toBe("unowned");
+    expect(await contender.tryAcquireOwnership()).toBe(false);
+
+    const failing = await loadPostgresOperationRuntime(answering);
+    lockResult = async () => {
+      throw new Error("Connection terminated unexpectedly");
+    };
+    await expect(failing.tryAcquireOwnership()).rejects.toThrow("Connection terminated unexpectedly");
+    // The statement may have taken the lock before failing, so ownership is uncertain, not merely absent.
+    expect(failing.ownership()).toBe("lost");
+    await expect(failing.tryAcquireOwnership()).rejects.toMatchObject({ ownership: "lost" });
+    await expect(failing.releaseOwnership()).rejects.toBeInstanceOf(NotOwnerError);
+  });
+
   test("initialization validates the random snapshot, including -0, before any statement", async () => {
     const client = stubClient();
     const invalid = [
@@ -257,6 +305,45 @@ function definePostgresTests(url: string): void {
     await initializePostgresSchedulerStorage(observer, simTime(initialTime), random ?? undefined);
   }
 
+  /** Backend PIDs of the sessions holding the driver lock, as the observer sees them. */
+  async function lockHolders(): Promise<number[]> {
+    const { rows } = await observer.query(
+      `SELECT pid FROM pg_locks
+       WHERE locktype = 'advisory' AND granted AND objsubid = 1 AND classid = $1 AND objid = $2
+         AND database = (SELECT oid FROM pg_database WHERE datname = current_database())
+       ORDER BY pid`,
+      [String(POSTGRES_DRIVER_LOCK_KEY >> 32n), String(POSTGRES_DRIVER_LOCK_KEY & 0xffff_ffffn)],
+    );
+    return rows.map((r) => r.pid);
+  }
+
+  /** A closed session's locks are released as its backend exits, just after the client sees it close. */
+  async function lockReleased(): Promise<void> {
+    for (let attempt = 0; attempt < 500; attempt++) {
+      if ((await lockHolders()).length === 0) return;
+      await Bun.sleep(10);
+    }
+    throw new Error("the driver lock was not released");
+  }
+
+  // Each test's connections, and with them any lock they hold, end with the test.
+  afterEach(async () => {
+    const open = drivers.splice(0);
+    for (const client of open) await client.end().catch(() => {});
+    if (open.length > 0) await lockReleased();
+  });
+
+  async function pidOf(client: pg.Client): Promise<number> {
+    return (await client.query("SELECT pg_backend_pid() AS pid")).rows[0].pid;
+  }
+
+  /** A runtime over `client` that has acquired ownership. */
+  async function owner(client: PostgresQueryable): Promise<PostgresOperationRuntime> {
+    const runtime = await loadPostgresOperationRuntime(client);
+    expect(await runtime.tryAcquireOwnership()).toBe(true);
+    return runtime;
+  }
+
   /** Everything committed, read through the observer connection. */
   async function committed() {
     const runtime = await observer.query(
@@ -319,6 +406,9 @@ function definePostgresTests(url: string): void {
     };
   }
 
+  /** An error shaped like one the server reported, with a SQLSTATE and severity. */
+  const serverError = () => Object.assign(new Error("injected database failure"), { code: "40001", severity: "ERROR" });
+
   /** `countAndRoll`, counting its invocations. */
   function counted() {
     const calls: string[] = [];
@@ -329,16 +419,21 @@ function definePostgresTests(url: string): void {
     return { calls, handler };
   }
 
+  // A contract test may ask for fresh storage more than once; each new one takes over the lock.
+  let contractOwner: PostgresOperationRuntime | undefined;
   describeSchedulerStorageContract("PostgreSQL operation runtime", async (initialTime) => {
+    // Only one from the same test still owns; afterEach ended earlier tests' connections.
+    if (contractOwner?.ownership() === "owned") await contractOwner.releaseOwnership();
     await reset(initialTime, null);
-    return (await loadPostgresOperationRuntime(await driver())).storage;
+    contractOwner = await owner(await driver());
+    return contractOwner.storage;
   });
 
   describe("PostgreSQL operation runtime", () => {
     test("a successful item commits its records, random position, clock, and receipt in one transaction on one client", async () => {
       await reset(0);
       const conn = faulty(await driver());
-      const runtime = await loadPostgresOperationRuntime(conn.client);
+      const runtime = await owner(conn.client);
       await runtime.scheduler.schedule(work("w1", 100, a, { n: 1 }));
       await runtime.scheduler.schedule(work("w2", 150, a, { n: 2 }));
       conn.seen.length = 0;
@@ -399,7 +494,7 @@ function definePostgresTests(url: string): void {
 
     test("resubmissions are harmless pending and completed, across new runtimes and storage adapters", async () => {
       await reset(0);
-      const runtime = await loadPostgresOperationRuntime(await driver());
+      const runtime = await owner(await driver());
       const original = work("w1", 10, a, { n: 1, tags: ["x", "y"] });
       expect(await runtime.scheduler.schedule(original)).toBe("accepted");
       expect(await runtime.scheduler.schedule(work("w2", 50, a, { n: 2 }))).toBe("accepted");
@@ -446,6 +541,8 @@ function definePostgresTests(url: string): void {
         }
       }
       // Advancing over its time again runs nothing: state, draws, clock, sequence, receipt, and queue are unchanged.
+      await runtime.releaseOwnership();
+      expect(await reloaded.tryAcquireOwnership()).toBe(true);
       await reloaded.scheduler.advanceTo(simTime(20), 10, through(reloaded, handler));
       expect(calls).toHaveLength(1);
       expect(await committed()).toEqual(done);
@@ -454,7 +551,7 @@ function definePostgresTests(url: string): void {
 
     test("deletions and records of other modules are committed by owner", async () => {
       await reset(0);
-      const runtime = await loadPostgresOperationRuntime(await driver());
+      const runtime = await owner(await driver());
       await runtime.scheduler.schedule(work("seed-b", 1, b));
       await runtime.scheduler.schedule(work("a-reads-b", 2, a));
       await runtime.scheduler.schedule(work("a-deletes", 3, a));
@@ -491,13 +588,14 @@ function definePostgresTests(url: string): void {
       test(`a database failure ${stage} leaves nothing of the item committed or visible`, async () => {
         await reset(0);
         const conn = faulty(await driver());
-        const runtime = await loadPostgresOperationRuntime(conn.client);
+        const runtime = await owner(conn.client);
         await runtime.scheduler.schedule(work("w1", 10, a, { n: 1 }));
         await runtime.scheduler.schedule(work("w2", 20, a, { n: 2 }));
         await runtime.scheduler.advanceTo(simTime(10), 10, through(runtime));
         const before = await committed();
 
-        conn.arm({ when, phase: "after" });
+        // Reported by the server, so the session, and with it ownership, survives.
+        conn.arm({ when, phase: "after", error: serverError });
         await expect(runtime.scheduler.advanceTo(simTime(30), 10, through(runtime))).rejects.toThrow(
           "injected database failure",
         );
@@ -524,7 +622,7 @@ function definePostgresTests(url: string): void {
 
     test("a handler failure discards staged effects, keeps the item pending, and leaves the clock at its time", async () => {
       await reset(0);
-      const runtime = await loadPostgresOperationRuntime(await driver());
+      const runtime = await owner(await driver());
       await runtime.scheduler.schedule(work("ok", 10, a, { n: 1 }));
       await runtime.scheduler.schedule(work("bad", 20, a, { n: 2 }));
       await runtime.scheduler.schedule(work("later", 30, a, { n: 3 }));
@@ -579,7 +677,7 @@ function definePostgresTests(url: string): void {
 
     test("ordering, work limits, and clock-only advancement match the in-memory scheduler", async () => {
       await reset(0);
-      const runtime = await loadPostgresOperationRuntime(await driver());
+      const runtime = await owner(await driver());
       const memory = createInMemoryScheduler();
       const items = [work("c", 50), work("a", 40), work("b", 50), work("d", 50), work("e", 5_000)];
       for (const item of items) {
@@ -611,7 +709,7 @@ function definePostgresTests(url: string): void {
 
     test("invalid values cannot become committed changes", async () => {
       await reset(0);
-      const runtime = await loadPostgresOperationRuntime(await driver());
+      const runtime = await owner(await driver());
       await runtime.scheduler.schedule(work("w", 10));
       await expect(runtime.scheduler.schedule(work("neg-zero", 10, a, { nested: [1, -0] }))).rejects.toThrow(TypeError);
 
@@ -661,7 +759,7 @@ function definePostgresTests(url: string): void {
       }
       // Without a configured stream, handlers get none and nothing is written for it.
       await reset(0, null);
-      const runtime = await loadPostgresOperationRuntime(await driver());
+      const runtime = await owner(await driver());
       await runtime.scheduler.schedule(work("w", 1));
       let received: unknown = "unset";
       await runtime.scheduler.advanceTo(simTime(1), 1, (w) => {
@@ -686,7 +784,7 @@ function definePostgresTests(url: string): void {
         DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION realmlib.test_reject_at_commit()`);
       try {
         const conn = faulty(await driver());
-        const runtime = await loadPostgresOperationRuntime(conn.client);
+        const runtime = await owner(conn.client);
         await runtime.scheduler.schedule(work("w", 10, a, "reject"));
         const before = await committed();
         await expect(runtime.scheduler.advanceTo(simTime(20), 10, through(runtime))).rejects.toMatchObject({
@@ -695,6 +793,7 @@ function definePostgresTests(url: string): void {
         });
         // The statements before COMMIT all succeeded; the server refused the commit itself.
         expect(conn.seen.at(-1)).toBe("COMMIT");
+        expect(runtime.ownership()).toBe("owned");
         expect(await committed()).toEqual(before);
         expect(runtime.read(a, "last")).toBeUndefined();
         expect(runtime.randomSnapshot()).toEqual(createSeededRandom(SEED).snapshot());
@@ -718,57 +817,73 @@ function definePostgresTests(url: string): void {
     /** The statement that reads the work item's durable record. */
     const receiptRead = (t: string) => t.includes("FROM realmlib.work_items WHERE work_id = $1");
 
-    test("a lost COMMIT reply after a real commit is confirmed from the receipt, and execution continues once", async () => {
+    test("a lost COMMIT reply after a real commit is confirmed from the receipt, and only a new owner continues", async () => {
       await reset(0);
-      const conn = faulty(await driver());
-      const runtime = await loadPostgresOperationRuntime(conn.client);
+      const target = await driver();
+      const conn = faulty(target);
+      const runtime = await owner(conn.client);
       await runtime.scheduler.schedule(work("w1", 10, a, { n: 1 }));
       await runtime.scheduler.schedule(work("w2", 20, a, { n: 2 }));
       const { calls, handler } = counted();
       conn.seen.length = 0;
       conn.arm(lostReply());
 
-      expect(await runtime.scheduler.advanceTo(simTime(30), 10, through(runtime, handler))).toEqual({
-        now: simTime(30),
-        executed: 2,
-        reachedTarget: true,
-      });
-      // Each handler ran once; the second saw the first's committed effects, reloaded from the database.
-      expect(calls).toEqual(['{"n":1}', '{"n":2}']);
-      expect(conn.seen.filter((t) => t === "COMMIT")).toHaveLength(2 + 1); // two items, one reconciliation read
+      // The receipt settles that w1 committed, but the failure cost the runtime its ownership.
+      const failure = await runtime.scheduler.advanceTo(simTime(30), 10, through(runtime, handler)).catch((e: unknown) => e);
+      expect(failure).toBeInstanceOf(NotOwnerError);
+      expect(failure).toMatchObject({ ownership: "lost", cause: { message: "Connection terminated unexpectedly" } });
+      expect(runtime.ownership()).toBe("lost");
+      expect(calls).toEqual(['{"n":1}']);
+      expect(conn.seen.filter((t) => t === "COMMIT")).toHaveLength(1 + 1); // the item, one reconciliation read
       const firstCommit = conn.seen.indexOf("COMMIT");
       expect(conn.seen.slice(firstCommit + 1, firstCommit + 3)).toEqual([
         "ROLLBACK",
         "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY",
       ]);
+      const partial = await committed();
+      expect(partial.items.map((r) => [r.work_id, r.status, r.completed_at_ms])).toEqual([
+        ["w1", "completed", "10"],
+        ["w2", "pending", null],
+      ]);
+      expect(partial.runtime.now_ms).toBe("10");
+      // Its views were reloaded from the receipt's snapshot, and stay readable.
+      expect(runtime.read(a, "count")).toBe(1);
+      expect(runtime.randomSnapshot()).toEqual(inMemoryReference([{ n: 1 }]).random);
 
+      // The session still holds the lock, so no one else can drive until its connection ends.
+      const contender = await loadPostgresOperationRuntime(await driver());
+      expect(await contender.tryAcquireOwnership()).toBe(false);
+      await expect(runtime.releaseOwnership()).rejects.toBeInstanceOf(NotOwnerError);
+      await expect(runtime.tryAcquireOwnership()).rejects.toBeInstanceOf(NotOwnerError);
+      expect(await lockHolders()).toEqual([await pidOf(target)]);
+      await target.end();
+      await lockReleased();
+
+      // The next owner runs only the remaining item, once, continuing the committed stream.
+      expect(await contender.tryAcquireOwnership()).toBe(true);
+      expect(await contender.scheduler.advanceTo(simTime(30), 10, through(contender, handler))).toEqual({
+        now: simTime(30),
+        executed: 1,
+        reachedTarget: true,
+      });
+      expect(calls).toEqual(['{"n":1}', '{"n":2}']);
       const reference = inMemoryReference([{ n: 1 }, { n: 2 }]);
       const view = await committed();
       expect(recordsOf(view)).toEqual(reference.records);
       expect(view.runtime).toEqual({ now_ms: "30", next_sequence: "2", random_snapshot: JSON.stringify(reference.random) });
-      expect(view.items.map((r) => [r.work_id, r.status, r.completed_at_ms])).toEqual([
-        ["w1", "completed", "10"],
-        ["w2", "completed", "20"],
-      ]);
-      expect(runtime.read(a, "count")).toBe(2);
-      expect(runtime.randomSnapshot()).toEqual(reference.random);
-
-      // Resubmitting either request, here or through a new runtime on another connection, changes nothing.
-      const reloaded = await loadPostgresOperationRuntime(await driver());
-      for (const scheduler of [runtime.scheduler, reloaded.scheduler]) {
-        expect(await scheduler.schedule(work("w1", 10, a, { n: 1 }))).toBe("already-completed");
-        await expect(scheduler.schedule(work("w1", 10, a, { n: 9 }))).rejects.toThrow("has already completed");
-      }
-      expect(await reloaded.scheduler.advanceTo(simTime(30), 10, through(reloaded, handler))).toMatchObject({ executed: 0 });
+      expect(contender.randomSnapshot()).toEqual(reference.random);
+      expect(await contender.scheduler.schedule(work("w1", 10, a, { n: 1 }))).toBe("already-completed");
+      await expect(contender.scheduler.schedule(work("w1", 10, a, { n: 9 }))).rejects.toThrow("has already completed");
+      expect(await contender.scheduler.advanceTo(simTime(30), 10, through(contender, handler))).toMatchObject({ executed: 0 });
       expect(calls).toHaveLength(2);
       expect(await committed()).toEqual(view);
-      expect(reloaded.read(a, "count")).toBe(2);
     });
 
-    test("a lost COMMIT that did not commit leaves the item pending, unexecuted, and runnable once on request", async () => {
+    test("a lost COMMIT that did not commit leaves the item pending, unexecuted, and runnable once by a new owner", async () => {
       await reset(0);
-      const conn = faulty(await driver());
-      const runtime = await loadPostgresOperationRuntime(conn.client);
+      const target = await driver();
+      const conn = faulty(target);
+      const runtime = await owner(conn.client);
       await runtime.scheduler.schedule(work("w1", 10, a, { n: 1 }));
       await runtime.scheduler.schedule(work("w2", 20, a, { n: 2 }));
       const before = await committed();
@@ -791,13 +906,21 @@ function definePostgresTests(url: string): void {
       expect(runtime.randomSnapshot()).toEqual(createSeededRandom(SEED).snapshot());
       expect(await runtime.scheduler.schedule(work("w1", 10, a, { n: 1 }))).toBe("already-pending");
 
-      // An explicit advance runs each item once, with the draws the lost attempt would have made.
-      expect(await runtime.scheduler.advanceTo(simTime(30), 10, through(runtime, handler))).toMatchObject({ executed: 2 });
+      // This runtime cannot advance again; its connection is ended instead.
+      expect(runtime.ownership()).toBe("lost");
+      await expect(runtime.scheduler.advanceTo(simTime(30), 10, through(runtime, handler))).rejects.toBeInstanceOf(NotOwnerError);
+      expect(calls).toHaveLength(1);
+      await target.end();
+      await lockReleased();
+
+      // A new owner runs each item once, with the draws the lost attempt would have made.
+      const next = await owner(await driver());
+      expect(await next.scheduler.advanceTo(simTime(30), 10, through(next, handler))).toMatchObject({ executed: 2 });
       expect(calls).toEqual(['{"n":1}', '{"n":1}', '{"n":2}']);
       const reference = inMemoryReference([{ n: 1 }, { n: 2 }]);
       expect(recordsOf(await committed())).toEqual(reference.records);
       expect((await committed()).runtime.random_snapshot).toBe(JSON.stringify(reference.random));
-      expect(runtime.randomSnapshot()).toEqual(reference.random);
+      expect(next.randomSnapshot()).toEqual(reference.random);
     });
 
     /** After a lost reply to a real commit, the observer changes the committed receipt before it is read. */
@@ -839,7 +962,7 @@ function definePostgresTests(url: string): void {
       test(`an unknown COMMIT outcome fails closed when ${situation}`, async () => {
         await reset(0);
         const conn = faulty(await driver());
-        const runtime = await loadPostgresOperationRuntime(conn.client);
+        const runtime = await owner(conn.client);
         await runtime.scheduler.schedule(work("w1", 10, a, { n: 1 }));
         await runtime.scheduler.schedule(work("w2", 20, a, { n: 2 }));
         const { calls, handler } = counted();
@@ -849,6 +972,7 @@ function definePostgresTests(url: string): void {
         expect((failure as Error).cause).toBeInstanceOf(Error);
         // Neither claimed as completed nor executed again, and the later item did not run.
         expect(calls).toEqual(['{"n":1}']);
+        expect(runtime.ownership()).toBe("lost");
         expect(() => runtime.read(a, "count")).toThrow("unusable");
         expect(() => runtime.randomSnapshot()).toThrow("unusable");
         await expect(runtime.scheduler.now()).rejects.toThrow("unusable");
@@ -874,7 +998,7 @@ function definePostgresTests(url: string): void {
           return target.query(text, values);
         },
       };
-      const runtime = await loadPostgresOperationRuntime(terminating);
+      const runtime = await owner(terminating);
       await runtime.scheduler.schedule(work("w", 10));
       const { calls, handler } = counted();
       terminate = true;
@@ -889,13 +1013,252 @@ function definePostgresTests(url: string): void {
       expect(seen.at(-1)).toBe("ROLLBACK");
       expect(await committed()).toEqual(before);
       expect(() => runtime.read(a, "count")).toThrow("unusable");
+      expect(runtime.ownership()).toBe("lost");
 
-      // A new runtime on a new connection reads the durable truth: still pending, run on request.
-      const fresh = await loadPostgresOperationRuntime(await driver());
+      // Once PostgreSQL has ended the session, a new owner reads the durable truth: still pending, run on request.
+      await lockReleased();
+      const fresh = await owner(await driver());
       expect(await fresh.scheduler.schedule(work("w", 10))).toBe("already-pending");
       expect(await fresh.scheduler.advanceTo(simTime(20), 10, through(fresh, handler))).toMatchObject({ executed: 1 });
       expect(calls).toHaveLength(2);
       expect(fresh.read(a, "count")).toBe(1);
+    });
+  });
+
+  describe("PostgreSQL driver ownership", () => {
+    test("one session owns at a time; a contender gets false, changes nothing, and cannot advance or write", async () => {
+      await reset(0);
+      const first = await driver();
+      const second = await driver();
+      const runtimeA = await loadPostgresOperationRuntime(first);
+      const conn = faulty(second);
+      const runtimeB = await loadPostgresOperationRuntime(conn.client);
+      await runtimeA.scheduler.schedule(work("w1", 10, a, { n: 1 }));
+      await runtimeA.scheduler.schedule(work("w2", 20, a, { n: 2 }));
+      expect(await lockHolders()).toEqual([]);
+
+      expect(await runtimeA.tryAcquireOwnership()).toBe(true);
+      expect(runtimeA.ownership()).toBe("owned");
+      expect(await lockHolders()).toEqual([await pidOf(first)]);
+
+      const before = await committed();
+      const { calls, handler } = counted();
+      expect(await runtimeB.tryAcquireOwnership()).toBe(false);
+      expect(runtimeB.ownership()).toBe("unowned");
+      conn.seen.length = 0;
+      await expect(runtimeB.scheduler.advanceTo(simTime(30), 10, through(runtimeB, handler))).rejects.toMatchObject({
+        name: "NotOwnerError",
+        ownership: "unowned",
+      });
+      await expect(runtimeB.storage.writeClock(simTime(15))).rejects.toBeInstanceOf(NotOwnerError);
+      await expect(runtimeB.storage.markCompleted(workItemId("w1"))).rejects.toBeInstanceOf(NotOwnerError);
+      const [due] = await runtimeB.storage.readDue(simTime(30), 1);
+      await expect(runtimeB.storage.runWork!(due!, () => through(runtimeB, handler)(due!))).rejects.toBeInstanceOf(
+        NotOwnerError,
+      );
+      // Refused before any statement; reads still work without ownership.
+      expect(conn.seen).toEqual([expect.stringContaining("FROM realmlib.work_items AS w")]);
+      expect(calls).toEqual([]);
+      expect(await committed()).toEqual(before);
+      expect(await runtimeB.scheduler.pendingCount()).toBe(2);
+
+      // The owner advances; neither its commit nor its rollback after a handler failure releases the lock.
+      expect(await runtimeA.scheduler.advanceTo(simTime(10), 10, through(runtimeA, handler))).toMatchObject({ executed: 1 });
+      expect(await lockHolders()).toEqual([await pidOf(first)]);
+      await expect(runtimeA.scheduler.advanceTo(simTime(30), 10, through(runtimeA, stageThenThrow))).rejects.toThrow(
+        "handler failed after staging",
+      );
+      expect(await lockHolders()).toEqual([await pidOf(first)]);
+      expect(await runtimeB.tryAcquireOwnership()).toBe(false);
+      expect(await runtimeA.scheduler.advanceTo(simTime(30), 10, through(runtimeA, handler))).toMatchObject({ executed: 1 });
+      expect(calls).toEqual(['{"n":1}', '{"n":2}']);
+      expect(runtimeA.ownership()).toBe("owned");
+      expect(await lockHolders()).toEqual([await pidOf(first)]);
+    });
+
+    test("an idle owner releases, and the next owner continues from the database without repeating work", async () => {
+      await reset(0);
+      const first = await driver();
+      const runtimeA = await owner(first);
+      for (const [id, at, n] of [["w1", 10, 1], ["w2", 20, 2], ["w3", 30, 3]] as const) {
+        await runtimeA.scheduler.schedule(work(id, at, a, { n }));
+      }
+      // Loaded before A executes anything, so its in-memory views are stale until it acquires.
+      const runtimeB = await loadPostgresOperationRuntime(await driver());
+      const { calls, handler } = counted();
+      expect(await runtimeA.scheduler.advanceTo(simTime(25), 10, through(runtimeA, handler))).toMatchObject({ executed: 2 });
+
+      await runtimeA.releaseOwnership();
+      expect(runtimeA.ownership()).toBe("unowned");
+      expect(await lockHolders()).toEqual([]);
+      const released = await committed();
+      // Released means unable to advance or write, before anything runs or changes.
+      await expect(runtimeA.scheduler.advanceTo(simTime(40), 10, through(runtimeA, handler))).rejects.toMatchObject({
+        ownership: "unowned",
+      });
+      await expect(runtimeA.storage.writeClock(simTime(40))).rejects.toBeInstanceOf(NotOwnerError);
+      await runtimeA.releaseOwnership();
+      expect(calls).toHaveLength(2);
+      expect(await committed()).toEqual(released);
+
+      expect(runtimeB.read(a, "count")).toBeUndefined();
+      expect(await runtimeB.tryAcquireOwnership()).toBe(true);
+      expect(await runtimeA.tryAcquireOwnership()).toBe(false);
+      // B reloaded the committed state and random stream when it acquired.
+      const reference = inMemoryReference([{ n: 1 }, { n: 2 }]);
+      expect(runtimeB.read(a, "count")).toBe(2);
+      expect(runtimeB.randomSnapshot()).toEqual(reference.random);
+      expect(await runtimeB.scheduler.now()).toBe(simTime(25));
+
+      expect(await runtimeB.scheduler.advanceTo(simTime(40), 10, through(runtimeB, handler))).toEqual({
+        now: simTime(40),
+        executed: 1,
+        reachedTarget: true,
+      });
+      expect(calls).toEqual(['{"n":1}', '{"n":2}', '{"n":3}']);
+      const final = inMemoryReference([{ n: 1 }, { n: 2 }, { n: 3 }]);
+      const view = await committed();
+      expect(recordsOf(view)).toEqual(final.records);
+      expect(view.runtime).toEqual({ now_ms: "40", next_sequence: "3", random_snapshot: JSON.stringify(final.random) });
+      expect(await runtimeB.scheduler.schedule(work("w1", 10, a, { n: 1 }))).toBe("already-completed");
+      await expect(runtimeB.scheduler.schedule(work("w2", 50, a, { n: 2 }))).rejects.toThrow("has already completed");
+
+      // Ownership can move back; A, too, reloads instead of using what it last saw.
+      await runtimeB.releaseOwnership();
+      expect(await runtimeA.tryAcquireOwnership()).toBe(true);
+      expect(runtimeA.read(a, "count")).toBe(3);
+      expect(runtimeA.randomSnapshot()).toEqual(final.random);
+      expect(await lockHolders()).toEqual([await pidOf(first)]);
+    });
+
+    test("acquiring and releasing are not reentrant, and release is refused while work is running", async () => {
+      await reset(0);
+      const client = await driver();
+      const runtime = await owner(client);
+      await expect(runtime.tryAcquireOwnership()).rejects.toThrow("already owns");
+      // A second runtime on the same session cannot share the lock it holds.
+      const sharing = await loadPostgresOperationRuntime(client);
+      await expect(sharing.tryAcquireOwnership()).rejects.toThrow("already holds the driver lock");
+      expect(sharing.ownership()).toBe("unowned");
+      // One release frees it, so it was taken only once.
+      await runtime.releaseOwnership();
+      expect(await lockHolders()).toEqual([]);
+
+      const [acquired, overlapping] = await Promise.allSettled([runtime.tryAcquireOwnership(), runtime.tryAcquireOwnership()]);
+      expect(acquired).toEqual({ status: "fulfilled", value: true });
+      expect(overlapping).toMatchObject({ status: "rejected", reason: { message: expect.stringContaining("in progress") } });
+
+      await runtime.scheduler.schedule(work("w1", 10, a, { n: 1 }));
+      await runtime.scheduler.schedule(work("w2", 20, a, { n: 2 }));
+      // Attempted from inside each item's callback, and while the call waits to start.
+      const attempts: Promise<unknown>[] = [];
+      const attempt = () => attempts.push(runtime.releaseOwnership().then(() => "released", (e: unknown) => e));
+      const advancing = runtime.scheduler.advanceTo(simTime(30), 10, (w) => {
+        attempt();
+        through(runtime)(w);
+      });
+      attempt();
+      expect(await advancing).toMatchObject({ executed: 2, reachedTarget: true });
+      expect(await Promise.all(attempts)).toEqual(
+        Array(3).fill(expect.objectContaining({ message: expect.stringContaining("while advanceTo() or a driver write") })),
+      );
+      expect(runtime.ownership()).toBe("owned");
+      expect(await lockHolders()).toEqual([await pidOf(client)]);
+      await runtime.releaseOwnership();
+
+      // If reloading fails after the lock is taken, the lock is given back.
+      await observer.query("INSERT INTO realmlib.state_records VALUES ('module-a', 'bad', '-0')");
+      await expect(runtime.tryAcquireOwnership()).rejects.toThrow("Invalid persisted state record");
+      expect(runtime.ownership()).toBe("unowned");
+      expect(await lockHolders()).toEqual([]);
+      await observer.query("DELETE FROM realmlib.state_records WHERE record_key = 'bad'");
+      expect(await runtime.tryAcquireOwnership()).toBe(true);
+    });
+
+    test("an owner whose connection is terminated fails closed, and the lock passes once the session ends", async () => {
+      await reset(0);
+      const client = await driver();
+      const pid = await pidOf(client);
+      const runtime = await owner(client);
+      await runtime.scheduler.schedule(work("w1", 10, a, { n: 1 }));
+      const { calls, handler } = counted();
+      const ended = new Promise((resolve) => client.once("end", resolve));
+      await observer.query("SELECT pg_terminate_backend($1, 5000)", [pid]);
+      await ended;
+
+      // The end of the connection was observed before anything else was tried.
+      expect(runtime.ownership()).toBe("lost");
+      await expect(runtime.scheduler.advanceTo(simTime(20), 10, through(runtime, handler))).rejects.toMatchObject({
+        ownership: "lost",
+      });
+      await expect(runtime.storage.writeClock(simTime(20))).rejects.toBeInstanceOf(NotOwnerError);
+      await expect(runtime.releaseOwnership()).rejects.toBeInstanceOf(NotOwnerError);
+      await expect(runtime.tryAcquireOwnership()).rejects.toBeInstanceOf(NotOwnerError);
+      expect(calls).toEqual([]);
+
+      await lockReleased();
+      const next = await owner(await driver());
+      expect(await next.scheduler.advanceTo(simTime(20), 10, through(next, handler))).toMatchObject({ executed: 1 });
+      expect(calls).toHaveLength(1);
+      expect(next.read(a, "count")).toBe(1);
+    });
+
+    test("a session terminated inside an item's transaction rolls the item back, and its owner stops", async () => {
+      await reset(0);
+      const target = await driver();
+      const pid = await pidOf(target);
+      const seen: string[] = [];
+      // No on(): the loss is observed only through the failing statement.
+      const terminating: PostgresQueryable = {
+        async query(text, values) {
+          seen.push(text);
+          if (text.startsWith("INSERT INTO realmlib.state_records")) {
+            await observer.query("SELECT pg_terminate_backend($1, 5000)", [pid]);
+          }
+          return target.query(text, values);
+        },
+      };
+      const runtime = await owner(terminating);
+      await runtime.scheduler.schedule(work("w1", 10, a, { n: 1 }));
+      await runtime.scheduler.schedule(work("w2", 20, a, { n: 2 }));
+      const before = await committed();
+      const { calls, handler } = counted();
+      seen.length = 0;
+
+      await expect(runtime.scheduler.advanceTo(simTime(30), 10, through(runtime, handler))).rejects.toThrow();
+      // The handler ran, its writes reached the server, and COMMIT was never sent.
+      expect(calls).toEqual(['{"n":1}']);
+      expect(seen).not.toContain("COMMIT");
+      expect(runtime.ownership()).toBe("lost");
+      await lockReleased();
+      // PostgreSQL discarded the open transaction with its session: not even the clock moved.
+      expect(await committed()).toEqual(before);
+
+      const next = await owner(await driver());
+      expect(await next.scheduler.advanceTo(simTime(30), 10, through(next, handler))).toMatchObject({ executed: 2 });
+      expect(calls).toEqual(['{"n":1}', '{"n":1}', '{"n":2}']);
+      expect(recordsOf(await committed())).toEqual(inMemoryReference([{ n: 1 }, { n: 2 }]).records);
+    });
+
+    test("a lock released behind the runtime's back is caught inside the next item's transaction", async () => {
+      await reset(0);
+      const client = await driver();
+      const runtime = await owner(client);
+      await runtime.scheduler.schedule(work("w1", 10, a, { n: 1 }));
+      const before = await committed();
+      await client.query("SELECT pg_advisory_unlock_all()");
+      // The local view still says owned; the database check does not.
+      expect(runtime.ownership()).toBe("owned");
+      const { calls, handler } = counted();
+      await expect(runtime.scheduler.advanceTo(simTime(20), 10, through(runtime, handler))).rejects.toMatchObject({
+        ownership: "lost",
+      });
+      expect(calls).toEqual([]);
+      expect(runtime.ownership()).toBe("lost");
+      expect(await committed()).toEqual(before);
+      // The transaction was rolled back, and another session may now drive.
+      expect((await client.query("SELECT pg_current_xact_id_if_assigned() AS xid")).rows).toEqual([{ xid: null }]);
+      expect(await (await loadPostgresOperationRuntime(await driver())).tryAcquireOwnership()).toBe(true);
     });
   });
 }

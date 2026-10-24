@@ -7,8 +7,8 @@
  * migrations, or runs work. Each method is one SQL statement, so each is atomic
  * by itself; this storage alone does not make a whole operation (its state,
  * random, queue, and clock changes) commit together. For that, see
- * `loadPostgresOperationRuntime()`. One scheduler should drive the database at
- * a time; that is assumed, not enforced.
+ * `loadPostgresOperationRuntime()`, which also enforces one driver at a time;
+ * this storage by itself assumes it and does not enforce it.
  */
 
 import { moduleId as toModuleId, workItemId as toWorkItemId } from "./identifiers.ts";

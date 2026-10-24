@@ -6,8 +6,13 @@
  * committed module state and random snapshot into memory, because handlers read
  * state synchronously; those in-memory copies change only after a confirmed
  * `COMMIT`. If a `COMMIT`'s outcome is unknown, the runtime reads the work
- * item's durable receipt before going on. Nothing here opens connections,
- * applies migrations, retries, or coordinates concurrent drivers.
+ * item's durable receipt to settle it.
+ *
+ * Advancing requires ownership: a PostgreSQL session-level advisory lock held
+ * on that same connection, so only one driver advances the database's
+ * simulation at a time. Acquiring and releasing it are explicit; a lost or
+ * uncertain connection loses ownership for good. Nothing here opens
+ * connections, applies migrations, retries, waits for the lock, or reconnects.
  */
 
 import { stageOperation } from "./execute-in-memory-operation.ts";
@@ -47,22 +52,102 @@ export class CommitOutcomeUnknownError extends Error {
  * `COMMIT` failed without showing whether it committed, and the durable record
  * then showed that it did not: the work item is still pending with its original
  * request and has no receipt. Nothing of the attempt was kept, including its
- * clock change. The item is not executed again automatically; a later
- * `advanceTo()` runs it. The runtime stays usable.
+ * clock change. The item is not executed again automatically. The runtime can
+ * still be read, but it has lost ownership; a later `advanceTo()` by a new
+ * owner runs the item.
  */
 export class CommitNotConfirmedError extends Error {
   override readonly name = "CommitNotConfirmedError";
+}
+
+/**
+ * The session-level advisory lock key held by the one driver of a database's
+ * simulation: the ASCII bytes of `"realmlib"` read as a big-endian 64-bit
+ * integer. PostgreSQL scopes advisory locks to the current database, and the
+ * `realmlib` schema holds one simulation, so this key covers that simulation.
+ * In `pg_locks` it appears as locktype `advisory`, classid 1919246700, objid
+ * 1835821410, objsubid 1.
+ */
+export const POSTGRES_DRIVER_LOCK_KEY = 8_243_101_811_291_744_610n;
+
+/** SQL that is true if this session holds {@link POSTGRES_DRIVER_LOCK_KEY}. */
+const HOLDS_LOCK = `EXISTS (
+  SELECT FROM pg_locks
+  WHERE locktype = 'advisory' AND database = (SELECT oid FROM pg_database WHERE datname = current_database())
+    AND classid = ${POSTGRES_DRIVER_LOCK_KEY >> 32n} AND objid = ${POSTGRES_DRIVER_LOCK_KEY & 0xffff_ffffn} AND objsubid = 1
+    AND pid = pg_backend_pid() AND granted
+)`;
+
+/**
+ * Whether a runtime may advance its simulation: `"owned"` while it holds the
+ * driver lock; `"unowned"` before acquiring, after releasing, and while either
+ * is in progress; `"lost"` once its connection failed or ended, or ownership
+ * otherwise became uncertain, after which it never owns again.
+ */
+export type DriverOwnership = "owned" | "unowned" | "lost";
+
+/**
+ * Advancing or a driver write was refused because the runtime does not own its
+ * simulation. Nothing was run or changed by the refused call.
+ */
+export class NotOwnerError extends Error {
+  override readonly name = "NotOwnerError";
+  /** Why: never acquired or released (`"unowned"`), or lost (`"lost"`). */
+  readonly ownership: Exclude<DriverOwnership, "owned">;
+
+  constructor(message: string, ownership: Exclude<DriverOwnership, "owned">, options?: ErrorOptions) {
+    super(message, options);
+    this.ownership = ownership;
+  }
 }
 
 export interface PostgresOperationRuntime {
   /**
    * Scheduler storage over the runtime's connection. It is the PostgreSQL
    * scheduler storage plus a `runWork()` that runs each item in a transaction.
+   * `runWork()`, `writeClock()`, and `markCompleted()` reject with
+   * {@link NotOwnerError} unless the runtime owns its simulation.
    */
   readonly storage: SchedulerStorage;
 
-  /** `createScheduler(storage)`. */
+  /**
+   * `createScheduler(storage)`, except that `advanceTo()` rejects with
+   * {@link NotOwnerError}, before reading anything or calling `execute`,
+   * unless the runtime owns its simulation. `schedule()` and reads need no
+   * ownership.
+   */
   readonly scheduler: Scheduler;
+
+  /**
+   * Tries once to make this runtime its simulation's driver by taking
+   * {@link POSTGRES_DRIVER_LOCK_KEY} with `pg_try_advisory_lock` on its
+   * connection. Resolves `true` once it holds the lock and has reloaded the
+   * committed state and random stream, or `false`, changing nothing, if another
+   * session holds it. It never waits or retries.
+   *
+   * @throws {NotOwnerError} if ownership was lost.
+   * @throws {Error} if this runtime already owns, an acquire or release is in
+   *   progress, the runtime is unusable, or this connection's session already
+   *   holds the lock (for example through another runtime).
+   * @throws a database error from the attempt, after which ownership is
+   *   `"lost"`; or a failure to reload, after which the lock is released again.
+   */
+  tryAcquireOwnership(): Promise<boolean>;
+
+  /**
+   * Releases the driver lock with `pg_advisory_unlock`, refusing advancement
+   * from the moment it is called. Resolves at once if the runtime does not own.
+   *
+   * @throws {Error} while `advanceTo()` or a driver write is running, or an
+   *   acquire or release is in progress; ownership is kept.
+   * @throws {NotOwnerError} if ownership was lost, or the session no longer
+   *   held the lock: the connection must then be ended, not reused.
+   * @throws a database error from the unlock, after which ownership is `"lost"`.
+   */
+  releaseOwnership(): Promise<void>;
+
+  /** This runtime's current {@link DriverOwnership}. */
+  ownership(): DriverOwnership;
 
   /**
    * Validates `input` and runs `handler` like `executeInMemoryOperation()`,
@@ -87,11 +172,12 @@ export interface PostgresOperationRuntime {
 const AMBIGUOUS_CLASSES = new Set(["08", "53", "57", "58", "XX"]);
 
 /**
- * Whether `error` is the server reporting that `COMMIT` failed, which means the
- * transaction rolled back. A server error carries a SQLSTATE and a severity;
- * errors without them (such as a lost connection) are ambiguous.
+ * Whether `error` is the server reporting that a statement failed on a session
+ * that is still usable, which for `COMMIT` means the transaction rolled back.
+ * A server error carries a SQLSTATE and a severity; errors without them (such
+ * as a lost connection) are ambiguous.
  */
-function commitDefinitelyFailed(error: unknown): boolean {
+function serverReported(error: unknown): boolean {
   if (typeof error !== "object" || error === null) return false;
   const { code, severity } = error as { code?: unknown; severity?: unknown };
   return (
@@ -165,24 +251,67 @@ function looksLikePool(client: object): boolean {
  * completion receipt. A handler failure rolls that back, then sets the clock to
  * the item's time on its own, leaving the item pending. A `COMMIT` with an
  * unknown outcome is settled from the item's durable record: a matching
- * receipt continues, a matching pending item rejects with
+ * receipt counts as committed, a matching pending item rejects with
  * {@link CommitNotConfirmedError}, and anything else with
- * {@link CommitOutcomeUnknownError}.
+ * {@link CommitOutcomeUnknownError}; in every case the runtime loses ownership.
  *
  * `client` must be one dedicated connection, such as a `pg` `Client` or a
  * `PoolClient` held for the runtime's lifetime, not in a transaction, and not
  * used by anything else meanwhile. The schema must be migrated and initialized.
- * Loading reads in one read-only transaction and writes nothing.
+ * Loading reads in one read-only transaction, writes nothing, and does not
+ * acquire ownership; advancing needs `tryAcquireOwnership()` first. If `client`
+ * has `on()` and `removeListener()`, as `pg` clients do, its `"end"` event is
+ * watched while the runtime owns.
  *
  * @throws {TypeError} if `client` has no `query` method or is a `pg` `Pool`.
  * @throws {TypeError} if persisted state or the random snapshot is invalid.
  * @throws if runtime state is missing or the database reports an error.
  */
 export async function loadPostgresOperationRuntime(client: PostgresQueryable): Promise<PostgresOperationRuntime> {
-  const db = validateClient(client);
-  if (looksLikePool(db)) {
+  const connection = validateClient(client);
+  if (looksLikePool(connection)) {
     throw new TypeError("client must be one dedicated connection, such as a pg Client or PoolClient, not a Pool");
   }
+
+  /** Internal steps of acquiring and releasing count as not owned. */
+  let state: "unowned" | "acquiring" | "owned" | "releasing" | "lost" = "unowned";
+  let lossReason: unknown;
+  /** The backend that took the lock; every ownership check requires the same one. */
+  let ownerPid: unknown;
+  /** advanceTo() calls and driver writes running; release waits for none of them, it refuses. */
+  let active = 0;
+
+  /** Ownership becomes uncertain, permanently, if it was held or being changed. */
+  function lose(reason: unknown): void {
+    if (state === "unowned" || state === "lost") return;
+    state = "lost";
+    lossReason = reason;
+    unwatch();
+  }
+
+  const onEnd = (): void => lose(new Error("The driver connection ended"));
+  type Events = { on(event: "end", listener: () => void): unknown; removeListener(event: "end", listener: () => void): unknown };
+  const events = connection as Partial<Record<keyof Events, unknown>>;
+  const emitter =
+    typeof events.on === "function" && typeof events.removeListener === "function" ? (connection as unknown as Events) : undefined;
+  function watch(): void {
+    emitter?.on("end", onEnd);
+  }
+  function unwatch(): void {
+    emitter?.removeListener("end", onEnd);
+  }
+
+  // Every statement goes through here: a failure the server did not report leaves the session in doubt.
+  const db: PostgresQueryable = {
+    async query(text, values) {
+      try {
+        return await connection.query(text, values);
+      } catch (error) {
+        if (!serverReported(error)) lose(error);
+        throw error;
+      }
+    },
+  };
 
   // In-memory copies of committed values, replaced wholesale when reconciliation reloads them.
   let { store, random } = await readOnly(db, () => readCommittedViews(db));
@@ -201,6 +330,131 @@ export async function loadPostgresOperationRuntime(client: PostgresQueryable): P
     }
   }
 
+  /** The runtime can no longer be trusted, and neither can its session's ownership. */
+  function breakRuntime(error: Error): Error {
+    broken = error;
+    lose(error);
+    return error;
+  }
+
+  function assertOwned(): void {
+    assertUsable();
+    if (state === "owned") return;
+    if (state === "lost") {
+      throw new NotOwnerError(
+        "This runtime has lost ownership of its simulation; end its connection and use a new one",
+        "lost",
+        { cause: lossReason },
+      );
+    }
+    throw new NotOwnerError("This runtime does not own its simulation; call tryAcquireOwnership() first", "unowned");
+  }
+
+  /** Confirms on the connection that its session is the one that took the lock, and still holds it. */
+  async function verifyOwnership(): Promise<void> {
+    let row: Record<string, unknown> | undefined;
+    try {
+      [row] = await query(db, `SELECT pg_backend_pid() AS pid, ${HOLDS_LOCK} AS held`, []);
+    } catch (error) {
+      lose(error);
+      throw error;
+    }
+    if (row?.pid !== ownerPid || row?.held !== true) {
+      const error = new NotOwnerError(
+        "This runtime's session no longer holds the driver lock; end its connection and use a new one",
+        "lost",
+      );
+      lose(error);
+      throw error;
+    }
+  }
+
+  async function unlock(): Promise<void> {
+    let row: Record<string, unknown> | undefined;
+    try {
+      [row] = await query(db, `SELECT pg_advisory_unlock(${POSTGRES_DRIVER_LOCK_KEY}) AS released`, []);
+    } catch (error) {
+      lose(error);
+      throw error;
+    }
+    if (row?.released !== true) {
+      const error = new NotOwnerError(
+        "This runtime's session did not hold the driver lock it was releasing; end its connection",
+        "lost",
+      );
+      lose(error);
+      throw error;
+    }
+    state = "unowned";
+    ownerPid = undefined;
+  }
+
+  async function tryAcquireOwnership(): Promise<boolean> {
+    assertUsable();
+    if (state === "lost") assertOwned();
+    if (state === "owned") throw new Error("This runtime already owns its simulation");
+    if (state !== "unowned") throw new Error("An ownership change is already in progress");
+    state = "acquiring";
+    let row: Record<string, unknown> | undefined;
+    try {
+      // Advisory locks are reentrant; a session that already holds this one is not locked again.
+      [row] = await query(
+        db,
+        `SELECT pg_backend_pid() AS pid, ${HOLDS_LOCK} AS held,
+                CASE WHEN ${HOLDS_LOCK} THEN NULL ELSE pg_try_advisory_lock(${POSTGRES_DRIVER_LOCK_KEY}) END AS acquired`,
+        [],
+      );
+    } catch (error) {
+      // The lock may have been taken even though the statement failed.
+      lose(error);
+      throw error;
+    }
+    if (row?.held === true) {
+      state = "unowned";
+      throw new Error(
+        "This connection's session already holds the driver lock; use one runtime per connection and release it there",
+      );
+    }
+    if (row?.acquired === false) {
+      state = "unowned";
+      return false;
+    }
+    if (row?.acquired !== true || typeof row.pid !== "number") {
+      const error = new Error("pg_try_advisory_lock returned an unexpected result");
+      lose(error);
+      throw error;
+    }
+    ownerPid = row.pid;
+    try {
+      // A previous owner may have committed since this runtime loaded; continue from the database.
+      ({ store, random } = await readOnly(db, () => readCommittedViews(db)));
+    } catch (error) {
+      // Gives the lock back unless the failure already left ownership in doubt.
+      if (state === "acquiring") {
+        state = "releasing";
+        await unlock().catch(() => {});
+      }
+      throw error;
+    }
+    watch();
+    state = "owned";
+    return true;
+  }
+
+  async function releaseOwnership(): Promise<void> {
+    if (state === "unowned") return;
+    if (state === "lost") assertOwned();
+    if (state !== "owned") throw new Error("An ownership change is already in progress");
+    if (active > 0) throw new Error("Cannot release ownership while advanceTo() or a driver write is running");
+    state = "releasing";
+    unwatch();
+    await unlock();
+  }
+
+  function ownership(): DriverOwnership {
+    return state === "owned" || state === "lost" ? state : "unowned";
+  }
+
   /** Wraps a storage method so it rejects once broken, or (if `writes`) during a transaction. */
   function guarded<A extends unknown[], R>(writes: boolean, method: (...args: A) => Promise<R>) {
     return async (...args: A): Promise<R> => {
@@ -216,7 +470,7 @@ export async function loadPostgresOperationRuntime(client: PostgresQueryable): P
     try {
       await query(db, "ROLLBACK", []);
     } catch (error) {
-      broken = new Error("ROLLBACK failed; the connection's transaction state is unknown", { cause: error });
+      breakRuntime(new Error("ROLLBACK failed; the connection's transaction state is unknown", { cause: error }));
       throw error;
     }
   }
@@ -249,14 +503,33 @@ export async function loadPostgresOperationRuntime(client: PostgresQueryable): P
   }
 
   async function runWork(work: StoredWork, run: () => void): Promise<void> {
-    assertUsable();
+    assertOwned();
     if (transacting) throw new Error("A work item's transaction is already open");
     transacting = true;
+    active++;
     try {
       await transact(work, run);
     } finally {
       transacting = false;
+      active--;
     }
+  }
+
+  /** Wraps a storage write so it runs only while owned, after confirming the lock on the connection. */
+  function ownedWrite<A extends unknown[]>(method: (...args: A) => Promise<void>) {
+    return async (...args: A): Promise<void> => {
+      assertOwned();
+      if (transacting) {
+        throw new Error("Cannot change scheduler storage while a work item's transaction is open");
+      }
+      active++;
+      try {
+        await verifyOwnership();
+        await method(...args);
+      } finally {
+        active--;
+      }
+    };
   }
 
   async function transact(work: StoredWork, run: () => void): Promise<void> {
@@ -264,6 +537,8 @@ export async function loadPostgresOperationRuntime(client: PostgresQueryable): P
     let staged: StagedOperation | undefined;
     let handlerFailed = false;
     try {
+      // The item commits only from the session that holds the lock.
+      await verifyOwnership();
       // Inside the transaction, so it commits with the effects and completed_at_ms reads it.
       await base.writeClock(work.at);
       current = { staged: undefined };
@@ -285,9 +560,10 @@ export async function loadPostgresOperationRuntime(client: PostgresQueryable): P
         await rollback().catch(() => {});
         throw error;
       }
-      // A failure of either statement is a database error, and propagates instead.
+      // A failure of any of these statements is a database error, and propagates instead.
       await rollback();
       // The established exception to atomicity: a failed item leaves the clock at its time.
+      await verifyOwnership();
       await base.writeClock(work.at);
       throw error;
     }
@@ -297,7 +573,7 @@ export async function loadPostgresOperationRuntime(client: PostgresQueryable): P
     } catch (error) {
       // Staged values are never published after an uncertain COMMIT; the durable record decides.
       staged?.end();
-      if (commitDefinitelyFailed(error)) throw error;
+      if (serverReported(error)) throw error;
       await reconcile(work, error);
       return;
     }
@@ -309,7 +585,9 @@ export async function loadPostgresOperationRuntime(client: PostgresQueryable): P
    * Settles a `COMMIT` whose outcome is unknown from the durable record of
    * `work`, read on this connection after its transaction has ended. Returns
    * if the matching receipt shows it committed; otherwise throws. Either way
-   * the in-memory views are first replaced by what is committed.
+   * the in-memory views are first replaced by what is committed. The `COMMIT`
+   * failure has already cost the runtime its ownership, so settling the outcome
+   * never lets it continue advancing.
    */
   async function reconcile(work: StoredWork, commitError: unknown): Promise<void> {
     const label = `COMMIT of work item ${JSON.stringify(work.id)}`;
@@ -329,12 +607,11 @@ export async function loadPostgresOperationRuntime(client: PostgresQueryable): P
         return { record, ...(await readCommittedViews(db)) };
       });
     } catch (error) {
-      broken = new CommitOutcomeUnknownError(
+      throw breakRuntime(new CommitOutcomeUnknownError(
         `${label} failed without showing whether it committed, and its durable record could not be read ` +
           `(${(error as Error)?.message ?? String(error)}); check the database before continuing with a new runtime`,
         { cause: commitError },
-      );
-      throw broken;
+      ));
     }
 
     const { record } = durable;
@@ -357,24 +634,23 @@ export async function loadPostgresOperationRuntime(client: PostgresQueryable): P
         : same
           ? `a receipt completed at ${record.completedAt}, not ${work.at}`
           : `${record.status} work with a different request or sequence`;
-    broken = new CommitOutcomeUnknownError(
+    throw breakRuntime(new CommitOutcomeUnknownError(
       `${label} failed without showing whether it committed, and the database holds ${found}; ` +
         "check the database before continuing with a new runtime",
       { cause: commitError },
-    );
-    throw broken;
+    ));
   }
 
   const storage: SchedulerStorage = {
     readClock: guarded(false, base.readClock),
-    writeClock: guarded(true, base.writeClock),
+    writeClock: ownedWrite(base.writeClock),
     readNextSequence: guarded(false, base.readNextSequence),
     insertPending: guarded(true, base.insertPending),
     readDue: guarded(false, base.readDue),
     countPending: guarded(false, base.countPending),
     readWorkIdStatus: guarded(false, base.readWorkIdStatus),
     readWork: guarded(false, base.readWork),
-    markCompleted: guarded(true, base.markCompleted),
+    markCompleted: ownedWrite(base.markCompleted),
     runWork,
   };
 
@@ -402,5 +678,32 @@ export async function loadPostgresOperationRuntime(client: PostgresQueryable): P
     return random?.snapshot();
   }
 
-  return { storage, scheduler: createScheduler(storage), execute, read, randomSnapshot };
+  const unguarded = createScheduler(storage);
+  const scheduler: Scheduler = {
+    now: unguarded.now,
+    pendingCount: unguarded.pendingCount,
+    schedule: unguarded.schedule,
+    advanceTo(target, maxOperations, execute) {
+      try {
+        assertOwned();
+      } catch (error) {
+        return Promise.reject(error);
+      }
+      active++;
+      return unguarded.advanceTo(target, maxOperations, execute).finally(() => {
+        active--;
+      });
+    },
+  };
+
+  return {
+    storage,
+    scheduler,
+    execute,
+    read,
+    randomSnapshot,
+    tryAcquireOwnership,
+    releaseOwnership,
+    ownership,
+  };
 }
