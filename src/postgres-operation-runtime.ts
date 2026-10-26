@@ -16,7 +16,7 @@
  */
 
 import { stageOperation } from "./execute-in-memory-operation.ts";
-import type { OperationHandler, StagedOperation } from "./execute-in-memory-operation.ts";
+import type { OperationHandler, StagedOperation, WorkEmitter } from "./execute-in-memory-operation.ts";
 import { moduleId as toModuleId } from "./identifiers.ts";
 import type { ModuleId } from "./identifiers.ts";
 import { createInMemoryStateStore } from "./in-memory-state.ts";
@@ -32,10 +32,11 @@ import {
   validateClient,
 } from "./postgres-scheduler-storage.ts";
 import type { PersistedWork, PostgresQueryable } from "./postgres-scheduler-storage.ts";
-import { createScheduler, sameWork } from "./scheduler.ts";
+import { admitEmittedWork, createScheduler, sameWork } from "./scheduler.ts";
 import type { Scheduler, SchedulerStorage, StoredWork } from "./scheduler.ts";
 import { createSeededRandom } from "./seeded-random.ts";
 import type { RandomSnapshot, SeededRandom } from "./seeded-random.ts";
+import type { SimTime } from "./sim-time.ts";
 
 /**
  * `COMMIT` failed in a way that does not show whether the transaction committed,
@@ -153,7 +154,9 @@ export interface PostgresOperationRuntime {
    * Validates `input` and runs `handler` like `executeInMemoryOperation()`,
    * against the committed state and random stream, for the work item whose
    * `advanceTo()` callback is running. Its changes and draws become part of that
-   * item's transaction and are published here only once it commits.
+   * item's transaction and are published here only once it commits. The
+   * handler also receives a {@link WorkEmitter} for work due at or after the
+   * item's time; that work is inserted in the same transaction.
    *
    * @throws {Error} if no callback of this runtime's scheduler is running, or
    *   this work item has already executed an operation.
@@ -247,9 +250,11 @@ function looksLikePool(client: object): boolean {
 /**
  * Loads the committed module state and random snapshot through `client` and
  * returns a runtime whose scheduler commits each successful work item in one
- * transaction: its clock, state-record changes, random stream position, and
- * completion receipt. A handler failure rolls that back, then sets the clock to
- * the item's time on its own, leaving the item pending. A `COMMIT` with an
+ * transaction: its clock, state-record changes, random stream position, the
+ * work its operation emitted (with the next sequence), and its completion
+ * receipt. A handler failure, or emitted work that cannot be stored, rolls
+ * that back, then sets the clock to the item's time on its own, leaving the
+ * item pending. A `COMMIT` with an
  * unknown outcome is settled from the item's durable record: a matching
  * receipt counts as committed, a matching pending item rejects with
  * {@link CommitNotConfirmedError}, and anything else with
@@ -322,7 +327,7 @@ export async function loadPostgresOperationRuntime(client: PostgresQueryable): P
   /** Set only while a work item's transaction is open. */
   let transacting = false;
   /** Set only while a work item's callback is running. */
-  let current: { staged: StagedOperation | undefined } | undefined;
+  let current: { at: SimTime; staged: StagedOperation | undefined } | undefined;
 
   function assertUsable(): void {
     if (broken !== undefined) {
@@ -475,7 +480,8 @@ export async function loadPostgresOperationRuntime(client: PostgresQueryable): P
     }
   }
 
-  async function writeEffects(staged: StagedOperation): Promise<void> {
+  /** Writes the staged operation's effects; `emitted` is its admitted work, with sequences. */
+  async function writeEffects(staged: StagedOperation, emitted: readonly StoredWork[]): Promise<void> {
     for (const [key, value] of staged.changes) {
       if (value === undefined) {
         await query(db, "DELETE FROM realmlib.state_records WHERE module_id = $1 AND record_key = $2", [
@@ -500,6 +506,8 @@ export async function loadPostgresOperationRuntime(client: PostgresQueryable): P
       );
       if (rows.length !== 1) throw missingRuntimeState();
     }
+    // Each insert also advances next_sequence, so the last leaves it past every emitted item.
+    for (const work of emitted) await base.insertPending(work, work.sequence + 1);
   }
 
   async function runWork(work: StoredWork, run: () => void): Promise<void> {
@@ -541,7 +549,7 @@ export async function loadPostgresOperationRuntime(client: PostgresQueryable): P
       await verifyOwnership();
       // Inside the transaction, so it commits with the effects and completed_at_ms reads it.
       await base.writeClock(work.at);
-      current = { staged: undefined };
+      current = { at: work.at, staged: undefined };
       try {
         run();
       } catch (error) {
@@ -551,7 +559,17 @@ export async function loadPostgresOperationRuntime(client: PostgresQueryable): P
         staged = current.staged;
         current = undefined;
       }
-      if (staged !== undefined) await writeEffects(staged);
+      let emitted: StoredWork[] = [];
+      if (staged !== undefined && staged.emitted.length > 0) {
+        // Read inside the transaction. Emitted work that cannot be stored fails the operation, like a handler error.
+        const admission = await admitEmittedWork(base, staged.emitted);
+        if ("rejected" in admission) {
+          handlerFailed = true;
+          throw admission.rejected;
+        }
+        emitted = admission.admitted;
+      }
+      if (staged !== undefined) await writeEffects(staged, emitted);
       await base.markCompleted(work.id);
     } catch (error) {
       staged?.end();
@@ -662,7 +680,7 @@ export async function loadPostgresOperationRuntime(client: PostgresQueryable): P
     if (current.staged !== undefined) {
       throw new Error("This work item has already executed an operation; only one operation per work item is supported");
     }
-    const staged = stageOperation(registry, store, input, handler, random);
+    const staged = stageOperation(registry, store, input, handler, random, current.at);
     if (!staged.ok) return staged;
     current.staged = staged;
     return staged.result;

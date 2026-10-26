@@ -64,6 +64,16 @@ export class WorkIdConflictError extends Error {
   }
 }
 
+/** @internal The {@link WorkIdConflictError} for different work submitted under the occupied ID `id`. */
+export function workIdConflict(id: WorkItemId, status: Exclude<WorkIdStatus, undefined>): WorkIdConflictError {
+  return new WorkIdConflictError(
+    status === "pending"
+      ? `Work item ${JSON.stringify(id)} is already pending with a different request`
+      : `Work item ${JSON.stringify(id)} has already completed with a different request; work IDs cannot be reused`,
+    status,
+  );
+}
+
 /**
  * Storage for one scheduler's clock, ordering sequence, pending work, and
  * completion receipts (each keeping its original work). It provides data access and mutation only: ordering and
@@ -269,6 +279,38 @@ export function sameWork(x: Omit<StoredWork, "sequence">, y: Omit<StoredWork, "s
   );
 }
 
+/**
+ * @internal Assigns sequences to work an operation emitted, in emission order,
+ * starting at the stored next sequence, without inserting anything. An item
+ * identical to work already stored under its ID (pending or completed) is
+ * left out and consumes no sequence. Emitted IDs must be distinct.
+ *
+ * Resolves to `{ rejected }` instead if the emitted work cannot be stored: a
+ * {@link WorkIdConflictError} if different work is stored under an emitted ID,
+ * or a `RangeError` if the sequences would pass `Number.MAX_SAFE_INTEGER`.
+ * Storage errors reject.
+ */
+export async function admitEmittedWork(
+  storage: Pick<SchedulerStorage, "readWork" | "readNextSequence">,
+  emitted: readonly Omit<StoredWork, "sequence">[],
+): Promise<{ readonly admitted: StoredWork[] } | { readonly rejected: Error }> {
+  const fresh: Omit<StoredWork, "sequence">[] = [];
+  for (const work of emitted) {
+    const existing = await storage.readWork(work.id);
+    if (existing === undefined) fresh.push(work);
+    else if (!sameWork(existing.work, work)) return { rejected: workIdConflict(work.id, existing.status) };
+  }
+  if (fresh.length === 0) return { admitted: [] };
+  const first = await storage.readNextSequence();
+  // Each item also needs a next sequence above its own.
+  if (first > Number.MAX_SAFE_INTEGER - fresh.length) {
+    return {
+      rejected: new RangeError(`Cannot emit ${fresh.length} work item(s): work sequences are exhausted at ${first}`),
+    };
+  }
+  return { admitted: fresh.map((work, index) => ({ ...work, sequence: first + index })) };
+}
+
 /** A fresh copy of stored work for a callback, so the callback cannot alter the queue. */
 function copyForCallback(work: StoredWork): ScheduledWork {
   const { moduleId, operation, payloadVersion, payload } = work.request;
@@ -324,12 +366,7 @@ export function createScheduler(storage: SchedulerStorage): Scheduler {
         if (sameWork(existing.work, { id, at, request })) {
           return existing.status === "pending" ? "already-pending" : "already-completed";
         }
-        throw new WorkIdConflictError(
-          existing.status === "pending"
-            ? `Work item ${JSON.stringify(id)} is already pending with a different request`
-            : `Work item ${JSON.stringify(id)} has already completed with a different request; work IDs cannot be reused`,
-          existing.status,
-        );
+        throw workIdConflict(id, existing.status);
       }
       const current = await storage.readClock();
       if (at < current) {

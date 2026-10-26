@@ -17,7 +17,7 @@ export type {
 export { createInMemoryStateStore } from "./in-memory-state.ts";
 export type { InMemoryStateStore, ModuleStateAccess, StateValue } from "./in-memory-state.ts";
 export { executeInMemoryOperation } from "./execute-in-memory-operation.ts";
-export type { OperationHandler } from "./execute-in-memory-operation.ts";
+export type { OperationHandler, WorkEmitter } from "./execute-in-memory-operation.ts";
 export { createScheduler, WorkIdConflictError } from "./scheduler.ts";
 export type {
   AdvanceResult,
@@ -30,6 +30,8 @@ export type {
   WorkRecord,
 } from "./scheduler.ts";
 export { createInMemoryScheduler, createInMemorySchedulerStorage } from "./in-memory-scheduler.ts";
+export { createInMemoryOperationRuntime } from "./in-memory-operation-runtime.ts";
+export type { InMemoryOperationRuntime } from "./in-memory-operation-runtime.ts";
 export { createPostgresSchedulerStorage, initializePostgresSchedulerStorage } from "./postgres-scheduler-storage.ts";
 export type { PostgresQueryable } from "./postgres-scheduler-storage.ts";
 export {

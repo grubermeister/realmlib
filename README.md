@@ -25,19 +25,20 @@ time), a registry for validating operation requests, an in-memory
 module state store, atomic execution of a single operation against that
 store, a manually advanced scheduler over replaceable storage (with in-memory
 and PostgreSQL implementations), seeded random streams
-whose draws commit with an operation, and a PostgreSQL path that commits each
-scheduled operation's effects in one transaction, advanced only by the one
-driver holding the database's ownership lock; it contains **no simulation
-engine or behavior**.
+whose draws commit with an operation, operations that emit follow-up work for
+any module, an in-memory operation runtime, and a PostgreSQL path that commits
+each scheduled operation's effects (emitted work included) in one transaction,
+advanced only by the one driver holding the database's ownership lock; it
+contains **no simulation engine or behavior**.
 
 **Current limits:** the PostgreSQL schema stores **one simulation per
 database**, and the driver lock is scoped to that database, so hosting several
-realms is not yet implemented. Modules can already interoperate in two ways: a
-module's handler can read any other module's state, and a host can schedule
-requests for different modules in advance and dispatch each to its handler. A
-running handler cannot enqueue further work, though: `schedule()` rejects while
-`advanceTo()` is dispatching. Emitting follow-up work atomically with an
-operation's effects is future work.
+realms is not yet implemented. Modules interoperate in three ways: a module's
+handler can read any other module's state, a host can schedule requests for
+different modules in advance and dispatch each to its handler, and a handler
+running under an operation runtime can [emit follow-up work](#emitting-follow-up-work)
+for any module, committed atomically with its operation. `schedule()` itself
+still rejects while `advanceTo()` is dispatching.
 
 The target runtime is Bun. Compatibility with Node.js or browsers is not established.
 
@@ -219,6 +220,8 @@ a.get(moduleId("module-a"), "from"); // still { value: 6 }: nothing was committe
   value), none of its changes are committed and the original error propagates.
 - Handlers must be synchronous. A non-function handler, or one returning a
   Promise or other thenable, throws `TypeError` and commits nothing.
+- The handler's fourth argument, `emitter`, is always `undefined` here:
+  emitting work needs an [operation runtime](#emitting-follow-up-work).
 - The staged view is valid only during the call; using it afterwards throws.
   Executing another operation against the same store from inside a handler
   throws. Only stores from `createInMemoryStateStore()` are supported.
@@ -289,7 +292,8 @@ result; // { now: 5000, executed: 1, reachedTarget: true }
   them, but with in-memory storage the promises resolve to the values at the
   time of the call.
 - The scheduler does not choose handlers, call `executeInMemoryOperation()` for
-  you, cancel work, or make queued work atomic with state changes.
+  you, or cancel work. By itself it does not make queued work atomic with state
+  changes; the [operation runtimes](#emitting-follow-up-work) do.
 
 ### Resubmitting work
 
@@ -426,6 +430,117 @@ const copy = createSeededRandom(JSON.parse(JSON.stringify(saved))); // continues
 - Draws are covered only through the handler's source; a stream captured some
   other way is not rolled back. In a scheduler callback, pass the stream
   explicitly and keep throwing when execution returns `{ ok: false }`.
+
+## Emitting follow-up work
+
+A handler can queue further work, for its own module or any other, as one of
+its operation's effects: "because this happened, run that operation at time
+T". Its fourth argument, a `WorkEmitter`, is present when the operation runs
+for a scheduled work item of an **operation runtime**: the in-memory one below,
+or the [PostgreSQL runtime](#atomic-postgresql-operations). The same handler
+runs under either.
+
+```ts
+import { createInMemoryOperationRuntime, createModuleRegistry, createSeededRandom, moduleId, simTime, workItemId } from "realmlib";
+import type { OperationHandler } from "realmlib";
+
+const weather = moduleId("weather");
+const soil = moduleId("soil");
+const registry = createModuleRegistry();
+registry.register({ id: weather, operations: [{ name: "rain", version: 1, validatePayload: (p) => typeof p === "number" }] });
+registry.register({ id: soil, operations: [{ name: "soak", version: 1, validatePayload: (p) => typeof p === "number" }] });
+
+// In the weather module: record the rain, and have the soil soak it up an hour later.
+const rain: OperationHandler = (request, state, _random, emitter) => {
+  const mm = request.payload as number;
+  state.set("last-rain", mm); // weather's own records only
+  emitter!.emit({
+    id: workItemId(`soak-after-${emitter!.now}`), // explicit and deterministic; never generated
+    at: simTime(emitter!.now + 3_600_000),
+    request: { moduleId: soil, operation: "soak", payloadVersion: 1, payload: mm },
+  });
+};
+// In the soil module.
+const soak: OperationHandler = (request, state) => {
+  state.set("moisture", ((state.get(soil, "moisture") as number | undefined) ?? 0) + (request.payload as number));
+};
+
+const runtime = createInMemoryOperationRuntime(simTime(0), createSeededRandom(12345).snapshot());
+await runtime.scheduler.schedule({
+  id: workItemId("rain-1"),
+  at: simTime(1_000),
+  request: { moduleId: weather, operation: "rain", payloadVersion: 1, payload: 12 },
+});
+const handlers = new Map<string, OperationHandler>([["rain", rain], ["soak", soak]]);
+await runtime.scheduler.advanceTo(simTime(7_200_000), 100, (work) => {
+  const outcome = runtime.execute(registry, work.request, handlers.get(work.request.operation)!);
+  if (!outcome.ok) throw new Error(`rejected: ${outcome.reason}`);
+});
+runtime.read(soil, "moisture"); // 12: the soak ran at 3_601_000
+```
+
+- `emitter.now` is the simulation time of the work item being executed.
+  `emitter.emit(work)` validates `work` like `schedule()` (work ID, time,
+  structural request envelope, `StateValue` payload; the registry is not
+  consulted) and requires `work.at` to be **`now` or later**. It stores a
+  copy and returns nothing. Invalid work throws `TypeError` or `RangeError`
+  and queues nothing; the handler may catch that and continue.
+- **Buffered, not scheduled:** emitting calls neither `schedule()` nor storage.
+  The emitted work is held with the operation's state changes and draws, and
+  the runtime stores it when it commits the item, in emission order and after
+  everything inserted before it, each taking the next insertion sequence. So
+  work emitted for `now` runs later in the same `advanceTo()` (after work
+  already queued for that time), within its `maxOperations` limit; work due
+  after the target stays pending. Emitting never runs work or moves the clock.
+- **All or nothing:** if the handler throws, the callback throws, or the
+  emitted work cannot be stored, none of the item's effects are kept: no
+  state, draws, or emitted work, and no receipt. The item stays pending and,
+  as for any failed item, the clock stays at its time; the error propagates.
+- **Work identity** follows [Resubmitting work](#resubmitting-work). Emitting
+  the same request twice in one operation, or a request identical to work
+  already pending or completed under its ID, is one work item: the repeat is
+  dropped and consumes no sequence. Different work under an ID this operation
+  already emitted throws `WorkIdConflictError` from `emit()`; different work
+  under a stored ID (pending or completed) is detected at commit and fails the
+  item with `WorkIdConflictError`, inserting none of its emitted work. Because
+  `at` may not be before `now`, an identical repeat of completed work whose
+  time has passed is rejected with `RangeError` instead.
+- **Bounds:** times are `SimTime`s. If the emitted items would need a
+  sequence past `Number.MAX_SAFE_INTEGER`, the item fails with `RangeError`.
+- The emitter is valid only during the handler call; using it afterwards
+  throws, even before the item commits. Writes still go only to the handler's
+  own module: emitting for another module grants no access to its state.
+- `executeInMemoryOperation()` and plain schedulers pass no emitter, and
+  `schedule()` still rejects while `advanceTo()` is dispatching, from a
+  handler or anywhere else.
+
+### In-memory operation runtime
+
+`createInMemoryOperationRuntime(initialTime?, random?)` is the in-memory
+counterpart of [`loadPostgresOperationRuntime()`](#atomic-postgresql-operations),
+without persistence or ownership. It holds new, empty module state, in-memory
+scheduler storage with the clock at `initialTime` (default `simTime(0)`), and,
+if `random` (a `RandomSnapshot`) is given, a random stream restored from it.
+
+- `runtime.scheduler` is `createScheduler(runtime.storage)`, where `storage` is
+  in-memory scheduler storage with a `runWork()`. `runtime.execute(registry,
+  input, handler)` works only inside its callbacks, at most once per item,
+  and validates and stages exactly like `executeInMemoryOperation()`.
+  `runtime.read(owner, key)` and `runtime.randomSnapshot()` return committed
+  values.
+- **Each item commits as a unit:** after the callback returns, the runtime
+  checks the emitted work against storage, then inserts it, records the
+  receipt, and publishes the state changes and draws, with no step left that
+  can fail. Until then, readers see the previous committed values. While an
+  item runs, `storage.insertPending()`, `writeClock()`, and `markCompleted()`
+  reject.
+- Nothing is persisted: everything lives as long as the runtime.
+
+**API additions:** `WorkEmitter`, `createInMemoryOperationRuntime`, and
+`InMemoryOperationRuntime`; an optional fourth `emitter` argument of
+`OperationHandler`. Existing handlers, signatures, and behavior are unchanged,
+except that `PostgresOperationRuntime.execute()` now passes handlers an
+emitter.
 
 ## PostgreSQL schema
 
@@ -570,14 +685,17 @@ await client.end();
 ```
 
 - **Transaction boundary:** one per executed item: `BEGIN`; set `now_ms` to the
-  item's time; the callback runs; upsert or delete its module's
-  `state_records`; write `random_snapshot` (if a stream is configured);
-  complete the `work_items` row (`completed_at_ms` is the clock inside the
-  transaction, so the item's time); `COMMIT`. A multi-item `advanceTo()` is not
-  one transaction: earlier items stay committed if a later one fails. Advancing
-  the clock to the target, or with no work, is its own single statement, as
-  before. Execution never changes `next_sequence`, because callbacks cannot
-  schedule work.
+  item's time; the callback runs; check any
+  [emitted work](#emitting-follow-up-work) against `work_items`; upsert or
+  delete its module's `state_records`; write `random_snapshot` (if a stream is
+  configured); insert the emitted work as pending rows, advancing
+  `next_sequence` past them; complete the `work_items` row (`completed_at_ms`
+  is the clock inside the transaction, so the item's time); `COMMIT`. A
+  multi-item `advanceTo()` is not one transaction: earlier items stay
+  committed if a later one fails. Advancing the clock to the target, or with
+  no work, is its own single statement, as before. An item that emits nothing
+  does not change `next_sequence`. No schema change was needed: emitted work
+  uses the existing `work_items` and `next_sequence`.
 - **One dedicated connection:** `client` must be a single connection, such as
   a `pg` `Client` or a `PoolClient` held for the runtime's lifetime, not inside
   a transaction and not used by anything else meanwhile. A `pg` `Pool` is
@@ -593,13 +711,15 @@ await client.end();
   validation, ownership, and copying. They are published to `read()`,
   `randomSnapshot()`, and later handlers only after `COMMIT` succeeds;
   otherwise they are discarded, so a failed attempt consumes no draws.
-- **Handler failure** (the callback throws or returns a thenable): the
+- **Handler failure** (the callback throws or returns a thenable, or its
+  emitted work conflicts with stored work or exhausts the sequences): the
   transaction rolls back, then the clock is set to the item's time by a
   separate statement, matching the scheduler's established behavior. The item
-  stays pending and its ID reserved; the error propagates.
-- **Database failure** before `COMMIT`: the transaction rolls back, including
-  its clock change, and the database error propagates; the clock is not moved
-  separately. If `COMMIT` itself is rejected by the server (for example by a
+  stays pending and its ID reserved; the error propagates. No emitted work or
+  sequence is kept.
+- **Database failure** before `COMMIT` (inserting emitted work included): the
+  transaction rolls back, including its clock change, and the database error
+  propagates; the clock is not moved separately. If `COMMIT` itself is rejected by the server (for example by a
   deferred constraint), nothing committed and the runtime stays usable.
 - **Unknown outcome:** if `COMMIT` fails without the server reporting an error
   (for example the reply is lost with the connection), that is not taken as a
@@ -611,11 +731,12 @@ await client.end();
   work being executed (ID, time, sequence, module, operation, payload version,
   and payload, as in [Resubmitting work](#resubmitting-work)):
   - **Completed**, matching, with `completed_at_ms` at the item's time: the
-    item committed. The in-memory state and random stream are replaced by the
+    item committed, and with it the work it emitted. The in-memory state and random stream are replaced by the
     values just read. The handler is not run again. Because the failure has
     already cost the runtime its [ownership](#driver-ownership), `advanceTo()`
     then rejects with `NotOwnerError` instead of continuing.
-  - **Pending**, matching: it did not commit. The in-memory views are replaced
+  - **Pending**, matching: it did not commit, so neither did any work it
+    emitted. The in-memory views are replaced
     by the values read (unchanged, since nothing committed), and `advanceTo()`
     rejects with `CommitNotConfirmedError`, whose `cause` is the `COMMIT`
     error. The item stays pending with the clock where it was before the item

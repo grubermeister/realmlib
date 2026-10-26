@@ -5,6 +5,7 @@ import pg from "pg";
 import {
   CommitNotConfirmedError,
   CommitOutcomeUnknownError,
+  createInMemoryOperationRuntime,
   createInMemoryScheduler,
   createInMemoryStateStore,
   createModuleRegistry,
@@ -18,9 +19,11 @@ import {
   NotOwnerError,
   POSTGRES_DRIVER_LOCK_KEY,
   simTime,
+  WorkIdConflictError,
   workItemId,
 } from "../src/index.ts";
 import type {
+  InMemoryOperationRuntime,
   OperationHandler,
   PostgresOperationRuntime,
   PostgresQueryable,
@@ -74,6 +77,64 @@ function through(runtime: PostgresOperationRuntime, handler: OperationHandler = 
   return (w: ScheduledWork): void => {
     const outcome = runtime.execute(registry, w.request, handler);
     if (!outcome.ok) throw new Error(`rejected: ${outcome.reason}`);
+  };
+}
+
+/** What `countRollAndEmit` emits: [id, at, module, payload]. */
+type Emission = [id: string, at: number, to: string, payload?: StateValue];
+
+/**
+ * `countAndRoll`, then emits the payload's `emits` in order as `op-x` work,
+ * then throws if the payload's `fail` is set.
+ */
+const countRollAndEmit: OperationHandler = (request, state, random, emitter) => {
+  countAndRoll(request, state, random);
+  const { emits = [], fail = false } = request.payload as { emits?: Emission[]; fail?: boolean };
+  for (const [id, at, to, payload] of emits) emitter!.emit(work(id, at, moduleId(to), payload ?? { n: 0 }));
+  if (fail) throw new Error("handler failed after emitting");
+};
+
+/** The members an emitting experiment needs, which both operation runtimes have. */
+type OperationRuntime = Pick<PostgresOperationRuntime & InMemoryOperationRuntime, "scheduler" | "storage" | "execute" | "read" | "randomSnapshot">;
+
+/**
+ * Runs the same causal experiment on either runtime: A's operations emit work
+ * for B and for themselves, at the current time and later, under a work
+ * limit. Returns what it executed and everything observable afterwards.
+ */
+async function emittingExperiment(runtime: OperationRuntime) {
+  const executed: string[] = [];
+  const execute = (w: ScheduledWork): void => {
+    const outcome = runtime.execute(registry, w.request, countRollAndEmit);
+    if (!outcome.ok) throw new Error(`rejected: ${outcome.reason}`);
+    executed.push(w.id);
+  };
+  await runtime.scheduler.schedule(
+    work("a1", 10, a, {
+      emits: [
+        ["b1", 10, b, { emits: [["a2", 10, a, { emits: [["a3", 60, a]] }]] }],
+        ["b2", 30, b],
+      ],
+    }),
+  );
+  await runtime.scheduler.schedule(work("b0", 10, b));
+  const results = [
+    await runtime.scheduler.advanceTo(simTime(50), 2, execute),
+    await runtime.scheduler.advanceTo(simTime(50), 100, execute),
+  ];
+  const pending = await runtime.storage.readDue(simTime(MAX), 100);
+  // One at a time: a pg connection runs one statement at a time.
+  const statuses: unknown[] = [];
+  for (const id of ["a1", "b0", "b1", "a2", "b2", "a3"]) statuses.push(await runtime.storage.readWorkIdStatus(workItemId(id)));
+  return {
+    results,
+    executed,
+    now: await runtime.scheduler.now(),
+    nextSequence: await runtime.storage.readNextSequence(),
+    pending: pending.map((w) => [w.id, w.at, w.sequence, w.request.moduleId, w.request.payload]),
+    statuses,
+    records: [a, b].map((owner) => ["count", "roll", "last"].map((key) => runtime.read(owner, key) ?? null)),
+    random: runtime.randomSnapshot() ?? null,
   };
 }
 
@@ -1259,6 +1320,234 @@ function definePostgresTests(url: string): void {
       // The transaction was rolled back, and another session may now drive.
       expect((await client.query("SELECT pg_current_xact_id_if_assigned() AS xid")).rows).toEqual([{ xid: null }]);
       expect(await (await loadPostgresOperationRuntime(await driver())).tryAcquireOwnership()).toBe(true);
+    });
+  });
+
+  describe("PostgreSQL work emission", () => {
+    test("emitted work commits in the item's transaction with its records, draws, sequence, clock, and receipt", async () => {
+      await reset(0);
+      const target = await driver();
+      const seen: string[] = [];
+      let armed = false;
+      let atCommit: Awaited<ReturnType<typeof committed>> | undefined;
+      // Once armed, records what another connection sees just before the next COMMIT is sent.
+      const client: PostgresQueryable = {
+        async query(text, values) {
+          seen.push(text);
+          if (armed && text === "COMMIT" && atCommit === undefined) atCommit = await committed();
+          return target.query(text, values);
+        },
+      };
+      const runtime = await owner(client);
+      await runtime.scheduler.schedule(work("source", 10, a, { emits: [["e1", 10, b], ["e2", 40, a, { n: 2 }]] }));
+      await runtime.scheduler.schedule(work("queued", 10, b));
+      const before = await committed();
+      seen.length = 0;
+      armed = true;
+
+      expect(await runtime.scheduler.advanceTo(simTime(100), 1, through(runtime, countRollAndEmit))).toEqual({
+        now: simTime(10),
+        executed: 1,
+        reachedTarget: false,
+      });
+      // Inside the transaction nothing was visible elsewhere.
+      expect(atCommit).toEqual(before);
+      armed = false;
+      const after = await committed();
+      expect(after.runtime).toEqual({ ...before.runtime, now_ms: "10", next_sequence: "4", random_snapshot: expect.any(String) });
+      expect(after.runtime.random_snapshot).not.toBe(before.runtime.random_snapshot);
+      expect(recordsOf(after)).toMatchObject({ count: 1 });
+      expect(recordsOf(after, b)).toEqual({});
+      expect(after.items).toEqual([
+        { work_id: "source", at_ms: "10", sequence: "0", payload: expect.any(String), status: "completed", completed_at_ms: "10" },
+        { work_id: "queued", at_ms: "10", sequence: "1", payload: '{"n":1}', status: "pending", completed_at_ms: null },
+        { work_id: "e1", at_ms: "10", sequence: "2", payload: '{"n":0}', status: "pending", completed_at_ms: null },
+        { work_id: "e2", at_ms: "40", sequence: "3", payload: '{"n":2}', status: "pending", completed_at_ms: null },
+      ]);
+      // One transaction: the inserts come after the operation's own effects and before its receipt.
+      const writes = seen.filter((text) => !text.trimStart().startsWith("SELECT"));
+      expect(writes).toEqual([
+        "BEGIN",
+        expect.stringMatching(/^UPDATE realmlib\.runtime_state SET now_ms = /),
+        expect.stringMatching(/^INSERT INTO realmlib\.state_records /),
+        expect.stringMatching(/^INSERT INTO realmlib\.state_records /),
+        expect.stringMatching(/^INSERT INTO realmlib\.state_records /),
+        expect.stringMatching(/^UPDATE realmlib\.runtime_state SET random_snapshot = /),
+        expect.stringMatching(/INSERT INTO realmlib\.work_items/),
+        expect.stringMatching(/INSERT INTO realmlib\.work_items/),
+        expect.stringMatching(/SET status = 'completed'/),
+        "COMMIT",
+      ]);
+
+      // The same advance continues with emitted work due now, after work queued before it.
+      const order: string[] = [];
+      await runtime.scheduler.advanceTo(simTime(100), 10, (w) => {
+        order.push(w.id);
+        through(runtime, countRollAndEmit)(w);
+      });
+      expect(order).toEqual(["queued", "e1", "e2"]);
+      expect(recordsOf(await committed(), b)).toMatchObject({ count: 2 });
+    });
+
+    test("emitted pending work survives closing the runtime, and the next owner runs it once", async () => {
+      await reset(0);
+      const first = await driver();
+      const runtime = await owner(first);
+      await runtime.scheduler.schedule(work("source", 10, a, { emits: [["later", 50, b, { n: 5 }]] }));
+      await runtime.scheduler.advanceTo(simTime(20), 10, through(runtime, countRollAndEmit));
+      await runtime.releaseOwnership();
+      await first.end();
+
+      const next = await owner(await driver());
+      expect(await next.scheduler.now()).toBe(simTime(20));
+      expect(await next.storage.readDue(simTime(MAX), 10)).toEqual([
+        { ...work("later", 50, b, { n: 5 }), sequence: 1 } as StoredWork,
+      ]);
+      const { calls, handler } = counted();
+      expect(await next.scheduler.advanceTo(simTime(60), 10, through(next, handler))).toMatchObject({ executed: 1 });
+      expect(await next.scheduler.advanceTo(simTime(60), 10, through(next, handler))).toMatchObject({ executed: 0 });
+      expect(calls).toEqual(['{"n":5}']);
+      expect(next.read(b, "last")).toEqual({ n: 5 });
+      expect(await next.storage.readWorkIdStatus(workItemId("later"))).toBe("completed");
+    });
+
+    test("a failed operation or rejected emission leaves no emitted work and consumes no sequence", async () => {
+      const cases: [string, StateValue, (runtime: PostgresOperationRuntime) => Promise<void>, unknown][] = [
+        ["the handler throws after emitting", { fail: true, emits: [["e1", 10, b], ["e2", 20, a]] }, async () => {}, "handler failed after emitting"],
+        [
+          "an emitted ID is completed with a different request",
+          { emits: [["e1", 10, b], ["done", 10, b]] },
+          async (runtime) => {
+            await runtime.scheduler.schedule(work("done", 5, a));
+            await runtime.scheduler.advanceTo(simTime(5), 1, through(runtime));
+          },
+          WorkIdConflictError,
+        ],
+        [
+          "an emitted ID is pending with a different request",
+          { emits: [["e1", 10, b], ["waiting", 99, b]] },
+          async (runtime) => void (await runtime.scheduler.schedule(work("waiting", 99, a))),
+          WorkIdConflictError,
+        ],
+        [
+          "the emitted work would exhaust the sequences",
+          { emits: [["e1", 10, b], ["e2", 10, b]] },
+          async () => void (await observer.query("UPDATE realmlib.runtime_state SET next_sequence = $1", [String(MAX - 2)])),
+          "work sequences are exhausted",
+        ],
+      ];
+      for (const [situation, payload, prepare, expected] of cases) {
+        await reset(0);
+        const runtime = await owner(await driver());
+        await prepare(runtime);
+        await runtime.scheduler.schedule(work("source", 10, a, payload));
+        const before = await committed();
+        const views = { records: runtime.read(a, "count"), random: runtime.randomSnapshot() };
+
+        const failure = await runtime.scheduler.advanceTo(simTime(30), 10, through(runtime, countRollAndEmit)).catch((e) => e);
+        if (typeof expected === "string") expect([situation, (failure as Error).message]).toEqual([situation, expect.stringContaining(expected)]);
+        else expect([situation, failure]).toEqual([situation, expect.any(expected as typeof Error)]);
+        // As for any failed operation, only the clock moved, to the item's time.
+        expect([situation, await committed()]).toEqual([situation, { ...before, runtime: { ...before.runtime, now_ms: "10" } }]);
+        expect({ records: runtime.read(a, "count"), random: runtime.randomSnapshot() }).toEqual(views);
+        expect(runtime.ownership()).toBe("owned");
+        await runtime.releaseOwnership();
+      }
+
+      // With room for exactly one more, a single emitted item takes the last sequence.
+      await reset(0);
+      await observer.query("UPDATE realmlib.runtime_state SET next_sequence = $1", [String(MAX - 2)]);
+      const runtime = await owner(await driver());
+      await runtime.scheduler.schedule(work("source", 10, a, { emits: [["last", 20, b]] }));
+      await runtime.scheduler.advanceTo(simTime(10), 10, through(runtime, countRollAndEmit));
+      const view = await committed();
+      expect(view.runtime.next_sequence).toBe(String(MAX));
+      expect(view.items.map((r) => [r.work_id, r.sequence, r.status])).toEqual([
+        ["source", String(MAX - 2), "completed"],
+        ["last", String(MAX - 1), "pending"],
+      ]);
+    });
+
+    test("a database failure while inserting emitted work rolls everything back, its clock change included", async () => {
+      await reset(0);
+      const conn = faulty(await driver());
+      const runtime = await owner(conn.client);
+      await runtime.scheduler.schedule(work("source", 10, a, { emits: [["e1", 10, b], ["e2", 20, b]] }));
+      const before = await committed();
+      // The second insert fails, after the first has run inside the transaction.
+      let inserts = 0;
+      conn.arm({ when: (t) => t.includes("INSERT INTO realmlib.work_items") && ++inserts === 2, phase: "before", error: serverError });
+
+      await expect(runtime.scheduler.advanceTo(simTime(30), 10, through(runtime, countRollAndEmit))).rejects.toThrow(
+        "injected database failure",
+      );
+      expect(await committed()).toEqual(before);
+      expect(runtime.read(a, "count")).toBeUndefined();
+      expect(runtime.ownership()).toBe("owned");
+      // The next attempt emits and commits the same work once.
+      expect(await runtime.scheduler.advanceTo(simTime(30), 10, through(runtime, countRollAndEmit))).toMatchObject({ executed: 3 });
+      expect((await committed()).items.map((r) => [r.work_id, r.sequence, r.status])).toEqual([
+        ["source", "0", "completed"],
+        ["e1", "1", "completed"],
+        ["e2", "2", "completed"],
+      ]);
+    });
+
+    test("an unknown COMMIT outcome is settled for emitted work by the source's receipt", async () => {
+      // Committed: the receipt and the emitted work are durable together.
+      await reset(0);
+      const lost = await driver();
+      let conn = faulty(lost);
+      let runtime = await owner(conn.client);
+      await runtime.scheduler.schedule(work("source", 10, a, { emits: [["e1", 15, b]] }));
+      conn.arm({ when: (t) => t === "COMMIT", phase: "after", error: () => new Error("Connection terminated unexpectedly") });
+      await expect(runtime.scheduler.advanceTo(simTime(30), 10, through(runtime, countRollAndEmit))).rejects.toBeInstanceOf(
+        NotOwnerError,
+      );
+      expect((await committed()).items.map((r) => [r.work_id, r.status])).toEqual([["source", "completed"], ["e1", "pending"]]);
+      expect((await committed()).runtime.next_sequence).toBe("2");
+      // The lost runtime's session still holds the lock until its connection ends.
+      await lost.end();
+      await lockReleased();
+
+      // Not committed: neither is the emitted work, and the next owner emits it once.
+      await reset(0);
+      const target = await driver();
+      conn = faulty(target);
+      runtime = await owner(conn.client);
+      await runtime.scheduler.schedule(work("source", 10, a, { emits: [["e1", 15, b]] }));
+      const before = await committed();
+      conn.arm({ when: (t) => t === "COMMIT", phase: "before", error: () => new Error("Connection terminated unexpectedly") });
+      await expect(runtime.scheduler.advanceTo(simTime(30), 10, through(runtime, countRollAndEmit))).rejects.toBeInstanceOf(
+        CommitNotConfirmedError,
+      );
+      expect(await committed()).toEqual(before);
+      await target.end();
+      await lockReleased();
+      const next = await owner(await driver());
+      expect(await next.scheduler.advanceTo(simTime(30), 10, through(next, countRollAndEmit))).toMatchObject({ executed: 2 });
+      expect((await committed()).items.map((r) => [r.work_id, r.sequence, r.status])).toEqual([
+        ["source", "0", "completed"],
+        ["e1", "1", "completed"],
+      ]);
+    });
+
+    test("an emitting experiment commits the same results as the in-memory runtime, and repeats exactly", async () => {
+      const random = createSeededRandom(SEED).snapshot();
+      const reference = await emittingExperiment(createInMemoryOperationRuntime(simTime(0), random));
+      expect(reference.executed).toEqual(["a1", "b0", "b1", "a2", "b2"]);
+      expect(reference.results).toEqual([
+        { now: simTime(10), executed: 2, reachedTarget: false },
+        { now: simTime(50), executed: 3, reachedTarget: true },
+      ]);
+      expect(reference.pending).toEqual([["a3", 60, 5, a, { n: 0 }]]);
+
+      for (let run = 0; run < 2; run++) {
+        await reset(0, random);
+        const runtime = await owner(await driver());
+        expect(await emittingExperiment(runtime)).toEqual(reference);
+        await runtime.releaseOwnership();
+      }
     });
   });
 }

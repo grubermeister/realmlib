@@ -573,6 +573,7 @@ test("internal staging helpers are not exported from the package root", async ()
     "NotOwnerError",
     "POSTGRES_DRIVER_LOCK_KEY",
     "WorkIdConflictError",
+    "createInMemoryOperationRuntime",
     "createInMemoryScheduler",
     "createInMemorySchedulerStorage",
     "createInMemoryStateStore",

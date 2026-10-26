@@ -28,7 +28,7 @@ test(
       );
       await writeFile(
         join(consumerDir, "probe.js"),
-        `import { entityId, moduleId, workItemId, simTime, createModuleRegistry, createInMemoryStateStore, executeInMemoryOperation, createInMemoryScheduler, createSeededRandom, createPostgresSchedulerStorage } from ${JSON.stringify(packageName)};\n` +
+        `import { entityId, moduleId, workItemId, simTime, createModuleRegistry, createInMemoryStateStore, executeInMemoryOperation, createInMemoryScheduler, createSeededRandom, createPostgresSchedulerStorage, createInMemoryOperationRuntime } from ${JSON.stringify(packageName)};\n` +
           `const registry = createModuleRegistry();\n` +
           `registry.register({ id: moduleId("m"), operations: [{ name: "o", version: 1, validatePayload: () => true }] });\n` +
           `const result = registry.validate({ moduleId: "m", operation: "o", payloadVersion: 1, payload: null });\n` +
@@ -39,7 +39,11 @@ test(
           `const scheduler = createInMemoryScheduler();\n` +
           `await scheduler.schedule({ id: workItemId("w"), at: simTime(5), request: { moduleId: moduleId("m"), operation: "o", payloadVersion: 1, payload: null } });\n` +
           `const advanced = await scheduler.advanceTo(simTime(10), 1, () => {});\n` +
-          `const values = [entityId("e"), moduleId("m"), workItemId("w"), simTime(0), result.ok, state.get(moduleId("m"), "k"), executed.ok, state.get(moduleId("m"), "j"), advanced, await scheduler.pendingCount(), createSeededRandom(1).nextFloat() * 2 ** 32, typeof createPostgresSchedulerStorage];\n` +
+          `const runtime = createInMemoryOperationRuntime();\n` +
+          `await runtime.scheduler.schedule({ id: workItemId("cause"), at: simTime(5), request: { moduleId: moduleId("m"), operation: "o", payloadVersion: 1, payload: null } });\n` +
+          `const emitting = (request, staged, _random, emitter) => { staged.set("seen", request.payload ?? "cause"); if (request.payload === null) emitter.emit({ id: workItemId("effect"), at: simTime(emitter.now + 1), request: { moduleId: moduleId("m"), operation: "o", payloadVersion: 1, payload: "effect" } }); };\n` +
+          `const caused = await runtime.scheduler.advanceTo(simTime(10), 10, (work) => { runtime.execute(registry, work.request, emitting); });\n` +
+          `const values = [entityId("e"), moduleId("m"), workItemId("w"), simTime(0), result.ok, state.get(moduleId("m"), "k"), executed.ok, state.get(moduleId("m"), "j"), advanced, await scheduler.pendingCount(), createSeededRandom(1).nextFloat() * 2 ** 32, typeof createPostgresSchedulerStorage, caused, runtime.read(moduleId("m"), "seen")];\n` +
           `console.log(${JSON.stringify(marker)}, JSON.stringify(values));\n`,
       );
       await mkdir(join(consumerDir, "node_modules"));
@@ -65,7 +69,7 @@ test(
       ]);
 
       expect(stderr).toBe("");
-      expect(stdout).toBe(`${marker} ["e","m","w",0,true,1,true,2,{"now":10,"executed":1,"reachedTarget":true},0,2442144158,"function"]\n`);
+      expect(stdout).toBe(`${marker} ["e","m","w",0,true,1,true,2,{"now":10,"executed":1,"reachedTarget":true},0,2442144158,"function",{"now":10,"executed":2,"reachedTarget":true},"effect"]\n`);
       expect(exitCode).toBe(0);
     } finally {
       if (child && child.exitCode === null) child.kill("SIGKILL");
