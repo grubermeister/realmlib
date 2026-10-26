@@ -1,8 +1,24 @@
 # realmlib
 
 `realmlib` is an independently maintained shared TypeScript library for Lattice
-simulation infrastructure. It is intended to be imported by `edgelord` and other
-Bun programs without depending on either.
+simulation infrastructure. It is a library, not a daemon, CLI, world engine, or
+game server, and it stays neutral about which program hosts it.
+
+Lattice aims to host multiple independent simulated worlds, each called a
+**realm**, with its own long-lived state, simulated clock, work queue, and
+configured simulation modules. The intended hosts are:
+
+- **`realmlord`** (planned; does not exist yet): the separate host of
+  long-lived realm simulations.
+- **`edgelord`** (existing): the live, player-facing game server, responsible
+  for active gameplay and the currently inhabited cross-section of a world, not
+  for hosting every long-lived simulation module.
+- **`realmrun`** (existing): a standalone offline Bun CLI that uses `realmlib`
+  for experiments without real-time pacing.
+
+Simulation modules developed independently are meant to build on `realmlib`'s
+contracts and eventually run under both `realmrun` and `realmlord`.
+`realmlib` itself depends on none of these programs.
 
 It currently provides foundational value types (identifiers and simulation
 time), a registry for validating operation requests, an in-memory
@@ -13,6 +29,15 @@ whose draws commit with an operation, and a PostgreSQL path that commits each
 scheduled operation's effects in one transaction, advanced only by the one
 driver holding the database's ownership lock; it contains **no simulation
 engine or behavior**.
+
+**Current limits:** the PostgreSQL schema stores **one simulation per
+database**, and the driver lock is scoped to that database, so hosting several
+realms is not yet implemented. Modules can already interoperate in two ways: a
+module's handler can read any other module's state, and a host can schedule
+requests for different modules in advance and dispatch each to its handler. A
+running handler cannot enqueue further work, though: `schedule()` rejects while
+`advanceTo()` is dispatching. Emitting follow-up work atomically with an
+operation's effects is future work.
 
 The target runtime is Bun. Compatibility with Node.js or browsers is not established.
 
