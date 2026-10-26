@@ -245,6 +245,38 @@ describe("emitting work", () => {
     expect(received).toBeUndefined();
   });
 
+  test("readers on other microtasks see an emitting item either wholly uncommitted or wholly committed", async () => {
+    const runtime = runtimeWithRandom();
+    const emits = [{ id: "e1", at: 20 }, { id: "e2", at: 30 }, { id: "e3", at: 40 }];
+    await runtime.scheduler.schedule(work("source", 10, a, { tag: "source", emits }));
+    const ids = ["source", "e1", "e2", "e3"].map((id) => workItemId(id));
+
+    // Starts every read in the same synchronous turn, so each sample is one instant.
+    const sample = () =>
+      Promise.all([
+        Promise.all(ids.map((id) => runtime.storage.readWorkIdStatus(id))),
+        runtime.storage.countPending(),
+        runtime.storage.readNextSequence(),
+        runtime.read(a, "log") ?? null,
+        runtime.randomSnapshot() ?? null,
+      ]);
+    const before = await sample();
+
+    let done = false;
+    const advanced = runtime.scheduler.advanceTo(simTime(10), 1, through(runtime)).finally(() => (done = true));
+    const samples: ReturnType<typeof sample>[] = [];
+    while (!done) {
+      samples.push(sample());
+      await undefined;
+    }
+    await advanced;
+    const after = await sample();
+    expect(after).not.toEqual(before);
+    expect(after[0]).toEqual(["completed", "pending", "pending", "pending"]);
+
+    for (const seen of await Promise.all(samples)) expect([before, after]).toContainEqual(seen);
+  });
+
   test("the in-memory runtime commits the same state and draws as executeInMemoryOperation()", async () => {
     const runtime = runtimeWithRandom();
     const store = createInMemoryStateStore();

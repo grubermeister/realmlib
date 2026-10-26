@@ -13,7 +13,7 @@ import type { OperationHandler, StagedOperation, WorkEmitter } from "./execute-i
 import type { ModuleId } from "./identifiers.ts";
 import { createInMemoryStateStore } from "./in-memory-state.ts";
 import type { StateValue } from "./in-memory-state.ts";
-import { createInMemorySchedulerStorage } from "./in-memory-scheduler.ts";
+import { createInMemorySchedulerStorageWithWrites } from "./in-memory-scheduler.ts";
 import type { ModuleRegistry, OperationValidationResult } from "./module-registry.ts";
 import { admitEmittedWork, createScheduler } from "./scheduler.ts";
 import type { Scheduler, SchedulerStorage, StoredWork } from "./scheduler.ts";
@@ -60,7 +60,8 @@ export interface InMemoryOperationRuntime {
  * a random stream restored from it (default none). Its scheduler commits each
  * successful work item as a unit: if the callback throws, or the emitted work
  * cannot be stored, nothing of the item is kept except the clock, which stays
- * at the item's time, and the item stays pending.
+ * at the item's time, and the item stays pending. Readers of the storage, state,
+ * or random stream never observe part of an item's commit.
  *
  * @throws {TypeError | RangeError} if `initialTime` or `random` is invalid.
  */
@@ -68,7 +69,7 @@ export function createInMemoryOperationRuntime(
   initialTime: SimTime = toSimTime(0),
   random?: RandomSnapshot,
 ): InMemoryOperationRuntime {
-  const base = createInMemorySchedulerStorage(initialTime);
+  const { storage: base, writes } = createInMemorySchedulerStorageWithWrites(initialTime);
   const store = createInMemoryStateStore();
   const stream = random === undefined ? undefined : createSeededRandom(random);
   /** Set only while a work item is running. */
@@ -104,10 +105,11 @@ export function createInMemoryOperationRuntime(
         if ("rejected" in admission) throw admission.rejected;
         emitted = admission.admitted;
       }
-      // Nothing below can fail: the emitted IDs are distinct and unused, their sequences start at
-      // the stored next sequence and stay safe, `work` is pending, and no other write runs meanwhile.
-      for (const item of emitted) await base.insertPending(item, item.sequence + 1);
-      await base.markCompleted(work.id);
+      // The commit runs synchronously, so no reader sees part of it. Nothing in it can fail: the
+      // emitted IDs are distinct and unused, their sequences start at the stored next sequence and
+      // stay safe, `work` is pending, and no other write runs meanwhile.
+      for (const item of emitted) writes.insertPending(item, item.sequence + 1);
+      writes.markCompleted(work.id);
       staged?.publish();
     } finally {
       staged?.end();

@@ -111,6 +111,28 @@ class MinHeap<T> {
  * @throws {TypeError | RangeError} if `initialTime` is not a valid {@link SimTime}.
  */
 export function createInMemorySchedulerStorage(initialTime: SimTime = toSimTime(0)): SchedulerStorage {
+  return createInMemorySchedulerStorageWithWrites(initialTime).storage;
+}
+
+/**
+ * @internal Synchronous forms of in-memory storage writes. Each takes effect, or
+ * throws, before it returns, so writes made in one synchronous run are never
+ * seen separately by readers.
+ */
+export interface InMemorySchedulerWrites {
+  writeClock(now: SimTime): void;
+  insertPending(work: StoredWork, nextSequence: number): void;
+  markCompleted(id: WorkItemId): void;
+}
+
+/**
+ * @internal Like {@link createInMemorySchedulerStorage}, also returning
+ * synchronous forms of its writes.
+ */
+export function createInMemorySchedulerStorageWithWrites(initialTime: SimTime = toSimTime(0)): {
+  storage: SchedulerStorage;
+  writes: InMemorySchedulerWrites;
+} {
   let clock = toSimTime(initialTime);
   let nextSequence = 0;
   const queue = new MinHeap<StoredWork>(precedes);
@@ -125,20 +147,12 @@ export function createInMemorySchedulerStorage(initialTime: SimTime = toSimTime(
     return undefined;
   }
 
-  return {
-    async readClock() {
-      return clock;
-    },
-
-    async writeClock(now) {
+  const writes: InMemorySchedulerWrites = {
+    writeClock(now) {
       clock = toSimTime(now);
     },
 
-    async readNextSequence() {
-      return nextSequence;
-    },
-
-    async insertPending(work, next) {
+    insertPending(work, next) {
       const stored = copyWork(work);
       if (status(stored.id) !== undefined) {
         throw new Error(`Work item ${JSON.stringify(stored.id)} is already ${status(stored.id)}`);
@@ -153,6 +167,34 @@ export function createInMemorySchedulerStorage(initialTime: SimTime = toSimTime(
       queue.push(stored);
       pending.set(stored.id, stored);
       nextSequence = next;
+    },
+
+    markCompleted(id) {
+      const work = pending.get(id);
+      if (work === undefined) {
+        throw new Error(`Work item ${JSON.stringify(id)} is not pending`);
+      }
+      queue.removeAt(queue.indexOf((item) => item.id === id));
+      pending.delete(id);
+      completed.set(id, work);
+    },
+  };
+
+  const storage: SchedulerStorage = {
+    async readClock() {
+      return clock;
+    },
+
+    async writeClock(now) {
+      writes.writeClock(now);
+    },
+
+    async readNextSequence() {
+      return nextSequence;
+    },
+
+    async insertPending(work, next) {
+      writes.insertPending(work, next);
     },
 
     async readDue(until, limit) {
@@ -181,15 +223,11 @@ export function createInMemorySchedulerStorage(initialTime: SimTime = toSimTime(
     },
 
     async markCompleted(id: WorkItemId) {
-      const work = pending.get(id);
-      if (work === undefined) {
-        throw new Error(`Work item ${JSON.stringify(id)} is not pending`);
-      }
-      queue.removeAt(queue.indexOf((item) => item.id === id));
-      pending.delete(id);
-      completed.set(id, work);
+      writes.markCompleted(id);
     },
   };
+
+  return { storage, writes };
 }
 
 /**
